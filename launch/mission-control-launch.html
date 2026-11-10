@@ -1,0 +1,587 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mission Control — your on-call shift, run by agents</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,300..800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+/* Night shift: the hour the pager goes off. Color is reserved for status meaning. */
+:root {
+  --night: #10131d;      /* the room at 3am */
+  --deck: #171b28;       /* app surfaces */
+  --deck-2: #1d2233;
+  --rule: #2b3146;
+  --paper: #ebe6d9;      /* warm text, never pure white */
+  --muted: #9a9db0;
+  --dim: #80869e;
+  --working: #f2a541;    /* amber: an agent is on it */
+  --needs: #f0524f;      /* signal red: only you can decide */
+  --done: #5ad19c;       /* green: closed */
+  --link: #8fb4ff;
+  --display: "Archivo", "Helvetica Neue", Arial, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; background: #07080d; color: var(--paper); font-family: var(--display); overflow: hidden; }
+body { display: grid; place-items: center; }
+
+/* A fixed 1600x900 stage, scaled to the window. */
+#frame { position: relative; width: 1600px; height: 900px; transform-origin: center; background: var(--night); overflow: hidden; }
+#stage { position: absolute; inset: 0; }
+.chapter { position: absolute; inset: 0; animation: chapter-in .7s ease both; }
+@keyframes chapter-in { from { opacity: 0; } to { opacity: 1; } }
+
+/* ---------- type ---------- */
+.wide { font-family: var(--display); font-stretch: 125%; font-weight: 750; letter-spacing: -0.02em; }
+.cap { text-wrap: pretty; font-size: 22px; color: var(--muted); font-weight: 400; line-height: 1.45; max-width: 760px; }
+.caption { position: absolute; left: 96px; bottom: 96px; max-width: 1240px; }
+.caption h2 { text-wrap: balance; font-size: 46px; line-height: 1.05; font-stretch: 118%; font-weight: 720; letter-spacing: -0.015em; }
+.caption p { text-wrap: pretty; margin-top: 14px; font-size: 21px; color: var(--muted); line-height: 1.45; max-width: 640px; }
+.reveal { opacity: 0; transform: translateY(10px); transition: opacity .6s ease, transform .6s ease; }
+.reveal.on { opacity: 1; transform: none; }
+
+/* ---------- cold open ---------- */
+.clock { position: absolute; left: 96px; top: 120px; font-size: 230px; line-height: .85; font-stretch: 125%; font-weight: 800; letter-spacing: -0.04em; color: var(--paper); }
+.clock small { display: block; font-size: 24px; font-stretch: 100%; font-weight: 400; letter-spacing: 0; color: var(--dim); margin-top: 26px; }
+.stack { position: absolute; right: 96px; top: 96px; width: 560px; display: flex; flex-direction: column; gap: 10px; }
+.notif { background: var(--deck); border: 1px solid var(--rule); border-radius: 12px; padding: 14px 16px; display: grid; grid-template-columns: 34px 1fr auto; gap: 12px; align-items: start;
+  opacity: 0; transform: translateX(40px); transition: opacity .35s ease, transform .35s cubic-bezier(.2,.8,.2,1); }
+.notif.on { opacity: 1; transform: none; }
+.notif .ico { width: 34px; height: 34px; border-radius: 8px; display: grid; place-items: center; font-family: var(--mono); font-size: 13px; font-weight: 600; color: var(--night); }
+.notif b { font-size: 15px; font-weight: 600; display: block; }
+.notif span { font-size: 14px; color: var(--muted); }
+.notif time { font-family: var(--mono); font-size: 12px; color: var(--dim); }
+.unread { position: absolute; left: 96px; top: 470px; font-size: 22px; color: var(--muted); }
+.unread b { color: var(--needs); font-weight: 650; font-variant-numeric: tabular-nums; }
+
+/* ---------- title ---------- */
+.title { position: absolute; inset: 0; display: grid; align-content: center; padding-left: 96px; }
+.title h1 { font-size: 168px; line-height: .9; font-stretch: 125%; font-weight: 800; letter-spacing: -0.045em; }
+.title h1 .ln { display: block; overflow: hidden; }
+.title h1 .ln i { display: block; font-style: normal; transform: translateY(105%); transition: transform 1s cubic-bezier(.2,.8,.15,1); }
+.title h1.on .ln i { transform: none; }
+.title h1 .ln:nth-child(2) i { transition-delay: .12s; }
+.title .cap { margin-top: 34px; font-size: 26px; }
+.orbit { position: absolute; right: -220px; top: 50%; width: 900px; height: 900px; margin-top: -450px; border-radius: 50%; border: 1px solid var(--rule); }
+.orbit::before, .orbit::after { content: ""; position: absolute; inset: 120px; border-radius: 50%; border: 1px solid var(--rule); }
+.orbit::after { inset: 260px; }
+.sweep { position: absolute; inset: 0; border-radius: 50%; background: conic-gradient(from 0deg, rgba(242,165,65,.18), transparent 22%); animation: sweep 6s linear infinite; }
+@keyframes sweep { to { transform: rotate(360deg); } }
+.blip { position: absolute; width: 10px; height: 10px; border-radius: 50%; }
+
+/* ---------- the app window ---------- */
+.app { position: absolute; left: 64px; top: 48px; width: 1472px; height: 600px; background: var(--deck); border: 1px solid var(--rule); border-radius: 14px; overflow: hidden; display: grid; grid-template-rows: 38px 1fr; box-shadow: 0 30px 80px rgba(0,0,0,.45); }
+.app-bar { display: flex; align-items: center; gap: 10px; padding: 0 16px; border-bottom: 1px solid var(--rule); font-size: 13px; color: var(--muted); }
+.app-bar .space { color: var(--paper); font-weight: 600; }
+.app-bar .pill { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--dim); }
+.app-body { display: grid; grid-template-columns: 1fr 560px; min-height: 0; }
+.term { padding: 22px 26px; font-family: var(--mono); font-size: 15px; line-height: 1.6; color: var(--paper); border-right: 1px solid var(--rule); overflow: hidden; position: relative; }
+.term .you { color: var(--paper); }
+.term .you::before { content: "❯ "; color: var(--working); }
+.term .bot { color: var(--muted); margin: 6px 0 14px; }
+.term .bot b { color: var(--paper); font-weight: 600; }
+.term .cmd { color: var(--dim); }
+.caret { display: inline-block; width: 9px; height: 18px; background: var(--paper); vertical-align: -3px; animation: blink 1s steps(1) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+
+/* the Mission Control panel, as in the real mod */
+.panel { background: #141826; display: flex; flex-direction: column; min-height: 0; font-family: var(--display); }
+.panel-head { display: flex; align-items: flex-end; gap: 14px; padding: 14px 18px 10px; }
+.panel-head h3 { font-size: 16px; font-weight: 650; margin-right: auto; }
+.panel-head span { font-size: 12px; color: var(--muted); }
+.panel-head .w { color: var(--working); }
+.rows { flex: 1; overflow: hidden; }
+.strip { margin: 8px 10px 4px; padding: 10px 12px; border-radius: 9px; background: rgba(240,82,79,.12); border: 1px solid rgba(240,82,79,.45); display: none; }
+.strip.on { display: block; animation: strip-in .5s cubic-bezier(.2,.8,.2,1) both; }
+@keyframes strip-in { from { opacity: 0; transform: translateY(-8px); } }
+.strip small { color: var(--needs); font-size: 12px; font-weight: 600; }
+.strip b { display: block; font-size: 14px; margin-top: 4px; font-weight: 600; }
+.strip span { font-size: 13px; color: var(--muted); }
+.row { display: grid; grid-template-columns: 3px 1fr; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--rule); opacity: 0; transform: translateX(16px); transition: opacity .45s ease, transform .45s cubic-bezier(.2,.8,.2,1); }
+.row.on { opacity: 1; transform: none; }
+.rail { border-radius: 2px; background: var(--dim); transition: background .4s; }
+.row .name { display: flex; gap: 8px; align-items: baseline; font-size: 14.5px; font-weight: 600; }
+.row .name em { margin-left: auto; font-style: normal; font-size: 12px; color: var(--dim); font-weight: 400; }
+.row .goal { font-size: 13px; color: var(--muted); margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.row .stats { font-size: 12px; color: var(--dim); margin-top: 3px; display: flex; gap: 12px; }
+.task { display: grid; grid-template-columns: 86px 1fr auto; column-gap: 8px; margin-top: 8px; padding: 6px 6px; border-radius: 6px; font-size: 13px; opacity: 0; transition: opacity .4s; }
+.task.on { opacity: 1; }
+.task .st { font-size: 12px; }
+.task .t { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.task .age { font-size: 12px; color: var(--dim); }
+.task .id { font-size: 12px; color: var(--dim); padding-left: 15px; }
+.task .sum { color: var(--muted); font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.task .links { grid-column: 2; font-size: 12px; color: var(--muted); display: flex; gap: 12px; }
+.task .links .pr { color: var(--link); }
+.spin::before { content: "⠋"; display: inline-block; width: 12px; animation: spin 0.9s steps(10) infinite; }
+@keyframes spin {
+  0% { content: "⠋"; } 10% { content: "⠙"; } 20% { content: "⠹"; } 30% { content: "⠸"; } 40% { content: "⠼"; }
+  50% { content: "⠴"; } 60% { content: "⠦"; } 70% { content: "⠧"; } 80% { content: "⠇"; } 90% { content: "⠏"; } }
+
+/* the Slack thread beside the window */
+.thread { position: absolute; right: 64px; top: 48px; width: 560px; height: 600px; background: #f4f1ea; color: #1d1c1d; border-radius: 14px; padding: 20px 22px; font-family: var(--display); overflow: hidden; box-shadow: 0 30px 80px rgba(0,0,0,.45);
+  opacity: 0; transform: translateY(14px); transition: opacity .5s, transform .5s; }
+.thread.on { opacity: 1; transform: none; }
+.thread h4 { font-size: 15px; font-weight: 700; } .thread h4 span { color: #616061; font-weight: 400; }
+.msg { display: grid; grid-template-columns: 36px 1fr; gap: 10px; margin-top: 16px; opacity: 0; transform: translateY(8px); transition: opacity .4s, transform .4s; }
+.msg.on { opacity: 1; transform: none; }
+.msg .av { width: 36px; height: 36px; border-radius: 7px; display: grid; place-items: center; font-weight: 700; color: #fff; font-size: 14px; }
+.msg b { font-size: 14px; } .msg b small { font-weight: 400; color: #616061; font-size: 12px; margin-left: 6px; }
+.msg p { font-size: 14px; line-height: 1.45; margin-top: 2px; }
+.msg p strong { font-weight: 700; }
+.msg p i { color: #616061; font-size: 12.5px; }
+
+/* the peek window and the dim veil for the "needs you" moment */
+.veil { position: absolute; inset: 0; background: rgba(7,8,13,.72); opacity: 0; transition: opacity .8s; pointer-events: none; }
+.veil.on { opacity: 1; }
+.lift { position: relative; z-index: 3; }
+.peek { position: absolute; left: 96px; top: 150px; width: 840px; background: #0f1220; border: 1px solid var(--rule); border-radius: 12px; overflow: hidden; z-index: 4; box-shadow: 0 30px 90px rgba(0,0,0,.6);
+  opacity: 0; transform: scale(.96); transition: opacity .4s, transform .4s cubic-bezier(.2,.8,.2,1); }
+.peek.on { opacity: 1; transform: none; }
+.peek .bar { padding: 9px 14px; border-bottom: 1px solid var(--rule); font-size: 13px; display: flex; gap: 10px; }
+.peek .bar b { font-weight: 600; } .peek .bar span { color: var(--needs); } .peek .bar em { margin-left: auto; color: var(--dim); font-style: normal; }
+.peek pre { padding: 16px 18px; font-family: var(--mono); font-size: 14px; line-height: 1.6; color: var(--muted); white-space: pre-wrap; }
+.peek pre b { color: var(--paper); font-weight: 500; }
+.cursor { position: absolute; width: 22px; height: 22px; z-index: 6; transition: left 1s cubic-bezier(.3,.7,.2,1), top 1s cubic-bezier(.3,.7,.2,1); }
+.cursor svg { filter: drop-shadow(0 2px 4px rgba(0,0,0,.5)); }
+.click { position: absolute; width: 40px; height: 40px; border-radius: 50%; border: 2px solid var(--paper); z-index: 5; animation: ping .6s ease-out forwards; }
+@keyframes ping { from { transform: scale(.3); opacity: 1; } to { transform: scale(1.4); opacity: 0; } }
+
+/* recipe editor */
+.editor { position: absolute; left: 64px; top: 48px; width: 700px; height: 560px; background: #0f1220; border: 1px solid var(--rule); border-radius: 14px; padding: 22px 24px; font-family: var(--mono); font-size: 14px; line-height: 1.5; color: var(--muted); overflow: hidden; white-space: pre; }
+.editor .k { color: var(--paper); } .editor .s { color: #e8c88f; } .editor .c { color: var(--dim); } .editor .h { color: var(--link); }
+.shell { position: absolute; left: 64px; top: 624px; width: 700px; padding: 14px 20px; background: #0f1220; border: 1px solid var(--rule); border-radius: 12px; font-family: var(--mono); font-size: 15px; color: var(--paper); }
+.shell::before { content: "$ "; color: var(--working); }
+.fleet { position: absolute; right: 64px; top: 48px; width: 700px; display: flex; flex-direction: column; gap: 12px; }
+.fleet .row { background: #141826; border: 1px solid var(--rule); border-radius: 10px; }
+.mode-tag { font-family: var(--mono); font-size: 11.5px; padding: 1px 7px; border-radius: 5px; border: 1px solid var(--rule); color: var(--muted); }
+
+/* doctor */
+.checks { position: absolute; left: 96px; top: 150px; display: flex; flex-direction: column; gap: 22px; }
+.check { display: grid; grid-template-columns: 54px 1fr; align-items: center; font-size: 34px; font-stretch: 110%; font-weight: 600; opacity: .25; transition: opacity .4s; }
+.check.on { opacity: 1; }
+.check i { font-style: normal; width: 40px; height: 40px; border-radius: 50%; border: 2px solid var(--dim); display: grid; place-items: center; font-size: 22px; color: transparent; transition: all .35s; }
+.check.on i { border-color: var(--done); background: var(--done); color: var(--night); }
+.doctor-term { position: absolute; right: 96px; top: 150px; width: 560px; padding: 22px; background: #0f1220; border: 1px solid var(--rule); border-radius: 12px; font-family: var(--mono); font-size: 14px; line-height: 1.7; color: var(--muted); white-space: pre; }
+.doctor-term b { color: var(--done); font-weight: 600; }
+
+/* close */
+.close { position: absolute; inset: 0; display: grid; align-content: center; padding-left: 96px; }
+.close h2 { text-wrap: balance; font-size: 92px; line-height: .98; font-stretch: 122%; font-weight: 780; letter-spacing: -0.035em; max-width: 1200px; }
+.close h2 span { color: var(--needs); }
+.install { margin-top: 46px; display: inline-flex; gap: 14px; align-items: center; padding: 16px 22px; border: 1px solid var(--rule); border-radius: 12px; background: var(--deck); font-family: var(--mono); font-size: 18px; width: fit-content; }
+.install::before { content: "$"; color: var(--working); }
+.close .cap { margin-top: 22px; }
+
+/* ---------- controls ---------- */
+#chrome { position: absolute; left: 0; right: 0; bottom: 0; height: 58px; display: flex; align-items: center; gap: 18px; padding: 0 28px; z-index: 10; }
+#play { width: 34px; height: 34px; border-radius: 50%; border: 1px solid var(--rule); background: var(--deck); color: var(--paper); cursor: pointer; font-size: 13px; }
+#play:focus-visible, .tick:focus-visible { outline: 2px solid var(--working); outline-offset: 3px; }
+#track { flex: 1; display: flex; gap: 6px; }
+.tick { flex: var(--w); white-space: nowrap; height: 30px; display: flex; flex-direction: column; justify-content: center; gap: 6px; cursor: pointer; background: none; border: 0; color: var(--dim); text-align: left; font-family: var(--display); font-size: 12.5px; }
+.tick .bar { height: 3px; border-radius: 2px; background: var(--rule); overflow: hidden; }
+.tick .bar i { display: block; height: 100%; width: 0; background: var(--paper); }
+.tick.now { color: var(--paper); }
+#hint { font-size: 12.5px; color: var(--dim); white-space: nowrap; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .001s !important; animation-iteration-count: 1 !important; transition-duration: .001s !important; }
+  .sweep { display: none; }
+}
+</style>
+</head>
+<body>
+<div id="frame" role="region" aria-label="Mission Control launch animation">
+  <div id="stage" aria-live="polite"></div>
+  <div id="chrome">
+    <button id="play" aria-label="Pause">❚❚</button>
+    <div id="track"></div>
+    <div id="hint">Space pause · ← → chapters · R replay</div>
+  </div>
+</div>
+
+<script>
+// A small timeline engine: each chapter builds its scene and returns timed events [seconds, fn].
+// The clock pauses, and chapters can be jumped to; every chapter rebuilds from its start.
+const $ = (tag, cls, html) => { const e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; };
+const on = (el) => () => el.classList.add("on");
+
+// Types `text` into `el`, one event per character, starting at `t0`. Returns the events and the end time.
+function typing(el, text, t0, cps = 26) {
+  const ev = [];
+  for (let i = 1; i <= text.length; i++) ev.push([t0 + i / cps, () => { el.textContent = text.slice(0, i); }]);
+  return { ev, end: t0 + text.length / cps };
+}
+
+const STATUS = {
+  triaging: `<span class="st spin" style="color:var(--working)"> triaging</span>`,
+  needs: `<span class="st" style="color:var(--needs)">● needs you</span>`,
+  done: `<span class="st" style="color:var(--done)">✓ done</span>`,
+  queued: `<span class="st" style="color:var(--dim)">◦ queued</span>`,
+};
+
+function appWindow(space = "Mission Control") {
+  const app = $("div", "app");
+  app.append($("div", "app-bar", `<span class="space">${space}</span><span>· operator</span><span class="pill">herdr</span>`));
+  const body = $("div", "app-body");
+  const term = $("div", "term");
+  const panel = $("div", "panel");
+  const head = $("div", "panel-head", `<h3>Mission Control</h3><span class="w" data-tri></span><span data-open>0 open</span><span data-watch>0 watching</span>`);
+  const strip = $("div", "strip");
+  const rows = $("div", "rows");
+  panel.append(head, strip, rows);
+  body.append(term, panel);
+  app.append(body);
+  return { app, term, panel, head, strip, rows };
+}
+
+function watcherRow({ channel, goal, stats, rail = "var(--dim)", mode }) {
+  const r = $("div", "row");
+  const railEl = $("div", "rail"); railEl.style.background = rail;
+  const body = $("div");
+  body.append($("div", "name", `${channel}<em>checked 4s ago</em>`), $("div", "goal", goal),
+              $("div", "stats", stats.map((s) => `<span>${s}</span>`).join("") + (mode ? `<span class="mode-tag">${mode}</span>` : "")));
+  r.append(railEl, body);
+  return { r, railEl, body };
+}
+
+function taskRow({ status, title, id, sum, links = [], age = "now" }) {
+  const t = $("div", "task");
+  t.innerHTML = `${STATUS[status]}<span class="t">${title}</span><span class="age">${age}</span>
+    <span class="id">${id}</span><span class="sum">${sum || ""}</span><span></span>
+    ${links.length ? `<span></span><span class="links">${links.join("")}</span>` : ""}`;
+  return t;
+}
+
+// Scene content. The shared build uses this demo data; a private build can set window.MC_DATA first.
+const DEMO = {
+  clock: "03:12",
+  notifs: [
+    ["#f0524f", "PD", "Checkout API p99 above SLO", "#alerts-payments · assigned to you", "03:11"],
+    ["#f2a541", "DQ", "orders table freshness: 3h behind", "#data-quality-alerts", "03:11"],
+    ["#f0524f", "PD", "Card authorization error rate 3× baseline", "#alerts-payments · assigned to you", "03:12"],
+    ["#8fb4ff", "Q", "“Anyone know how to rotate the export key?”", "#ask-platform-team", "03:12"],
+    ["#f2a541", "RB", "TimeoutError on /api/refunds (spiking)", "#errors-payments", "03:12"],
+    ["#f0524f", "PD", "Checkout API p99 above SLO (again)", "#alerts-payments · assigned to you", "03:12"],
+  ],
+  unread: { count: 60, channels: 4 },
+  ask: {
+    text: "watch #alerts-payments for pages assigned to me. triage them and reply in the thread.",
+    reply: "Started watcher <b>w-alerts-payments</b> on #alerts-payments.<br>It checks every 60s. Workers post impact, root cause and mitigation in each page's thread.",
+    watcher: { channel: "#alerts-payments", goal: "Pages assigned to the on-call. Triage, then reply in the thread.", stats: ["1 check", "0 messages", "every 60s"], mode: "triage-reply" },
+  },
+  triage: {
+    watcher: { channel: "#alerts-payments", goal: "Pages assigned to the on-call. Triage, then reply in the thread.", stats: ["214 checks", "38 messages", "1 matched", "every 60s"], mode: "triage-reply" },
+    task: { title: "Checkout API p99 above SLO in us-east", id: "task-012", sum: "Checking latency by region and the last deploy…" },
+    channel: "#alerts-payments",
+    alert: { av: "PD", color: "#06ac38", who: "PagerDuty", time: "3:12 AM", body: "<strong>Triggered:</strong> Checkout API p99 above SLO (us-east)<br>Assigned: you" },
+    worker: "Mission Control worker",
+    footer: "Triage by an AI agent (Mission Control task-012).",
+    replies: [
+      ["1/3 Impact", "Ongoing. 4.1% of checkout requests over 2s since 03:05, us-east only. Look now: customer-facing.", "3:14 AM", "Impact: 4.1% of checkouts over 2s, us-east, ongoing."],
+      ["2/3 Root cause", "Connection pool exhausted after config rollout 2291 halved max connections (high confidence; 3 links).", "3:17 AM", "Cause: pool exhausted after config 2291."],
+      ["3/3 Mitigation", "Roll back config 2291. Owner: payments on-call. Verify: p99 under 800ms within 5 min.", "3:19 AM", "Fix: roll back config 2291; verify p99 < 800ms."],
+    ],
+  },
+  needs: {
+    you: "what's going on",
+    bot: "3 watchers running. task-012 is mitigated and posted.<br>task-011 needs your decision.",
+    head: { tri: "1 triaging", open: "3 open", watch: "3 watching" },
+    watchers: [
+      { channel: "#alerts-payments", goal: "Pages assigned to the on-call.", stats: ["231 checks", "41 messages", "every 60s"], mode: "triage-reply", rail: "var(--working)",
+        tasks: [
+          { status: "triaging", flag: true, title: "Card authorization error rate 3× baseline", id: "task-011", sum: "Errors began with config rollout 2291 at 03:09.", links: ["PR #4821", "grafana", "source"], age: "2m" },
+          { status: "done", title: "Checkout API p99 above SLO in us-east", id: "task-012", sum: "Rolled back; p99 back to 610ms.", age: "6m" } ] },
+      { channel: "#data-quality-alerts", goal: "Data-monitoring alerts on our tables.", stats: ["31 checks", "every 10m"], mode: "triage-only",
+        tasks: [ { status: "triaging", title: "orders table freshness: 3h behind", id: "task-010", sum: "Upstream ETL job delayed; checking re-run ETA." } ] },
+      { channel: "#ask-platform-team", goal: "Unanswered questions for the team.", stats: ["96 checks", "every 2m"], mode: "draft-answer",
+        tasks: [ { status: "queued", title: "How do I rotate the export job's key?", id: "task-013", sum: "" } ] },
+    ],
+    strip: { title: "Card authorization error rate 3× baseline", msg: "Rollback of config 2291 needs your approval. Error rate still rising." },
+    peek: { id: "task-011", lines: [["Finding", "errors started 03:09, 40s after config rollout 2291"], ["Evidence", "auth p95 2.1s → 9.8s · pool waits 0 → 1.4k/min · <span style=\"color:var(--link)\">PR #4821</span> reverts it"], ["Ask", "approve the rollback? I can't change production."]],
+            answer: "approved. roll it back and watch the error rate." },
+  },
+  recipe: {
+    file: "payments-oncall.toml", name: "payments-oncall",
+    modes: [["triage-reply", ["Triage read-only in three steps and reply", "in the alert thread after each. Never ack or", "resolve the page."]],
+            ["fix-with-pr", ["Find the cause. If it is a clear code bug,", "write a failing test, fix it, open a DRAFT PR."]]],
+    watchers: [["#alerts-payments", 60, "triage-reply", "Pages assigned to me."], ["#errors-payments", null, "fix-with-pr", null]],
+    fleet: [["#alerts-payments", "Pages assigned to me.", "every 60s", "triage-reply"], ["#errors-payments", "New or spiking errors in payments services.", "every 5m", "fix-with-pr"],
+            ["#data-quality-alerts", "Data-monitoring alerts on our tables.", "every 10m", "triage-only"], ["#ask-platform-team", "Unanswered questions for the team.", "every 2m", "draft-answer"]],
+  },
+};
+const D = window.MC_DATA || DEMO;
+
+const chapters = [
+  {
+    title: `${Number(D.clock.slice(0, 2))}:${D.clock.slice(3)} am`, dur: 9,
+    build(root) {
+      root.append($("div", "clock wide", `${D.clock}<small>Your phone, on call.</small>`));
+      const stack = $("div", "stack");
+      const els = D.notifs.map(([c, ico, b, s, t]) => {
+        const n = $("div", "notif", `<div class="ico" style="background:${c}">${ico}</div><div><b>${b}</b><span>${s}</span></div><time>${t}</time>`);
+        stack.append(n); return n;
+      });
+      const unread = $("div", "unread reveal", `<b>0</b> unread across ${D.unread.channels} channels`);
+      root.append(stack, unread);
+      const ev = els.map((n, i) => [0.6 + i * 0.75, on(n)]);
+      ev.push([1.2, on(unread)]);
+      const steps = 40;
+      for (let i = 1; i <= steps; i++) ev.push([1.2 + i * 0.12, () => { unread.querySelector("b").textContent = Math.round(D.unread.count * (i / steps) ** 1.6).toLocaleString("en-US"); }]);
+      const cap = $("div", "caption reveal", `<h2>The pager doesn't care what time it is.</h2>`);
+      root.append(cap); ev.push([6.0, on(cap)]);
+      return ev;
+    },
+  },
+  {
+    title: "Mission Control", dur: 6,
+    build(root) {
+      const orbit = $("div", "orbit"); orbit.append($("div", "sweep"));
+      [["18%", "30%", "var(--working)"], ["70%", "22%", "var(--done)"], ["40%", "76%", "var(--needs)"]].forEach(([l, t, c]) => {
+        const b = $("div", "blip"); b.style.left = l; b.style.top = t; b.style.background = c; orbit.append(b);
+      });
+      const title = $("div", "title");
+      const h1 = $("h1", "", `<span class="ln"><i>Mission</i></span><span class="ln"><i>Control</i></span>`);
+      const cap = $("p", "cap reveal", "Your on-call shift, run by agents. You make the calls that matter.");
+      title.append(h1, cap);
+      root.append(orbit, title);
+      return [[0.3, on(h1)], [1.6, on(cap)]];
+    },
+  },
+  {
+    title: "Ask once", dur: 11,
+    build(root) {
+      const w = appWindow();
+      root.append(w.app);
+            const you = $("div", "you"); const caret = $("span", "caret");
+      w.term.append(you, caret);
+      const ty = typing(you, D.ask.text, 0.6, 30);
+      const ev = [...ty.ev];
+      const reply = $("div", "bot reveal", D.ask.reply);
+      ev.push([ty.end + 0.3, () => { caret.remove(); w.term.append(reply); }], [ty.end + 0.4, on(reply)]);
+      const row = watcherRow({ ...D.ask.watcher, rail: "var(--done)" });
+      w.rows.append(row.r);
+      ev.push([ty.end + 1.0, () => { row.r.classList.add("on"); w.head.querySelector("[data-watch]").textContent = "1 watching"; }]);
+      const cap = $("div", "caption reveal", `<h2>One sentence starts a watcher.</h2><p>It reads the channel on its own schedule and decides what's worth an agent.</p>`);
+      cap.style.bottom = "84px";
+      root.append(cap); ev.push([ty.end + 2.0, on(cap)]);
+      return ev;
+    },
+  },
+  {
+    title: "Triage, in the thread", dur: 15,
+    build(root) {
+      const T = D.triage;
+      const w = appWindow();
+      w.app.style.width = "860px"; w.app.querySelector(".app-body").style.gridTemplateColumns = "1fr";
+      w.term.style.display = "none";
+      root.append(w.app);
+      const row = watcherRow({ ...T.watcher, rail: "var(--working)" });
+      row.r.classList.add("on"); w.rows.append(row.r);
+      w.head.querySelector("[data-watch]").textContent = "1 watching";
+      w.head.querySelector("[data-open]").textContent = "1 open";
+      w.head.querySelector("[data-tri]").textContent = "1 triaging";
+      const task = taskRow({ status: "triaging", ...T.task });
+      row.body.append(task);
+      const thread = $("div", "thread", `<h4>Thread <span>· ${T.channel}</span></h4>`);
+      root.append(thread);
+      const page = $("div", "msg", `<div class="av" style="background:${T.alert.color}">${T.alert.av}</div><div><b>${T.alert.who}<small>${T.alert.time}</small></b><p>${T.alert.body}</p></div>`);
+      thread.append(page);
+      const replies = T.replies.map(([label, body, time]) => {
+        const m = $("div", "msg", `<div class="av" style="background:#4a3f8c">MC</div><div><b>${T.worker}<small>${time}</small></b>
+          <p><strong>${label}:</strong> ${body}<br><i>${T.footer}</i></p></div>`);
+        thread.append(m); return m;
+      });
+      const cap = $("div", "caption reveal", `<h2>Impact first. Then cause. Then the fix.</h2><p>Each worker posts as it learns, so the thread is useful within minutes.</p>`);
+      cap.style.bottom = "84px";
+      root.append(cap);
+      const sum = task.querySelector(".sum");
+      const ev = [[0.3, on(thread)], [0.9, on(page)], [1.8, on(task)], [10.0, on(cap)]];
+      replies.forEach((m, i) => ev.push([3.4 + i * 2.8, () => { on(m)(); sum.textContent = T.replies[i][3]; }]));
+      return ev;
+    },
+  },
+  {
+    title: "Only what needs you", dur: 13,
+    build(root) {
+      const N = D.needs;
+      const w = appWindow();
+      w.app.style.height = "636px";
+      root.append(w.app);
+      w.term.innerHTML = `<div class="you">${N.you}</div><div class="bot">${N.bot}</div>`;
+      const hd = w.head;
+      hd.querySelector("[data-tri]").textContent = N.head.tri; hd.querySelector("[data-open]").textContent = N.head.open; hd.querySelector("[data-watch]").textContent = N.head.watch;
+      let flagged = null; const others = [];
+      const rows = N.watchers.map((spec, wi) => {
+        const x = watcherRow(spec);
+        spec.tasks.forEach((ts) => {
+          const el = taskRow({ ...ts, links: (ts.links || []).map((l) => l.startsWith("PR") ? `<span class="pr">${l}</span>` : l) });
+          x.body.append(el); el.classList.add("on");
+          if (ts.flag) flagged = el; else others.push(el);
+        });
+        x.r.classList.add("on"); w.rows.append(x.r);
+        return { x, wi, hasFlag: spec.tasks.some((ts) => ts.flag) };
+      });
+      w.strip.innerHTML = `<small>Needs you</small><b>${N.strip.title}</b><span>${N.strip.msg}</span>`;
+      const veil = $("div", "veil"); root.append(veil);
+      const peek = $("div", "peek", `<div class="bar"><b>${N.peek.id}</b><span>needs you</span><em>keep as tab · ✕</em></div>
+        <pre>${N.peek.lines.map(([k, v]) => `<b>${k.padEnd(9)}</b> ${v}`).join("\n")}
+
+<span style="color:var(--working)">❯</span> <span data-ans></span></pre>`);
+      root.append(peek);
+      const cursor = $("div", "cursor", `<svg viewBox="0 0 24 24" width="22" height="22"><path d="M4 2l15 9-6.5 1.5L10 19z" fill="#ebe6d9" stroke="#10131d" stroke-width="1.2"/></svg>`);
+      cursor.style.left = "700px"; cursor.style.top = "560px"; root.append(cursor);
+      const cap = $("div", "caption reveal", `<h2>Everything else waits. <span style="color:var(--needs)">This</span> can't.</h2><p>Watchers escalate only what needs a human. One click opens the agent that found it.</p>`);
+      cap.style.bottom = "84px"; cap.style.zIndex = 5; root.append(cap);
+      const ty = typing(peek.querySelector("[data-ans]"), N.peek.answer, 8.2, 30);
+      return [
+        [0.8, () => { if (flagged) flagged.querySelector(".st").outerHTML = STATUS.needs; w.strip.classList.add("on"); hd.querySelector("[data-tri]").textContent = ""; }],
+        [1.8, () => { veil.classList.add("on"); w.app.classList.add("lift"); w.term.style.opacity = .25;
+                      rows.forEach((r) => { if (!r.hasFlag) r.x.r.style.opacity = .25; }); others.forEach((el) => { el.style.opacity = .25; }); }],
+        [2.6, on(cap)],
+        [3.6, () => { cursor.style.left = "1300px"; cursor.style.top = "165px"; }],
+        [4.8, () => { const k = $("div", "click"); k.style.left = "1290px"; k.style.top = "153px"; root.append(k); }],
+        [5.1, on(peek)],
+        ...ty.ev,
+      ];
+    },
+  },
+  {
+    title: "Recipes", dur: 13,
+    build(root) {
+      const R = D.recipe;
+      const ed = $("div", "editor"); root.append(ed);
+      const lines = [`<span class="c"># ${R.file}</span>`, `<span class="k">name</span> = <span class="s">"${R.name}"</span>`, ""];
+      R.modes.forEach(([name, prompt]) => {
+        lines.push(`<span class="h">[modes.${name}]</span>`);
+        prompt.forEach((l, i) => lines.push(i === 0 ? `<span class="k">prompt</span> = <span class="s">"""${l}</span>` : `<span class="s">${l}${i === prompt.length - 1 ? '"""' : ""}</span>`));
+        lines.push("");
+      });
+      R.watchers.forEach(([ch, interval, mode, interest]) => {
+        lines.push(`<span class="h">[[watchers]]</span>`, `<span class="k">channel</span>  = <span class="s">"${ch}"</span>`);
+        if (interval) lines.push(`<span class="k">interval</span> = ${interval}`);
+        lines.push(`<span class="k">mode</span>     = <span class="s">"${mode}"</span>`);
+        if (interest) lines.push(`<span class="k">interest</span> = <span class="s">"${interest}"</span>`);
+        lines.push("");
+      });
+      lines.push(`<span class="c"># … ${R.fleet.length - R.watchers.length} more</span>`);
+      const ev = [];
+      lines.forEach((l, i) => ev.push([0.3 + i * 0.16, () => { ed.innerHTML += l + "\n"; }]));
+      const sh = $("div", "shell"); root.append(sh);
+      const ty = typing(sh, `oncall-mc start --recipe ${R.name}`, 0.3 + lines.length * 0.16 + 0.4, 28);
+      ev.push(...ty.ev);
+      const fleet = $("div", "fleet"); root.append(fleet);
+      R.fleet.map(([ch, goal, every, mode]) => watcherRow({ channel: ch, goal, stats: ["starting", every], mode, rail: "var(--done)" }))
+        .forEach((x, i) => { fleet.append(x.r); ev.push([ty.end + 0.5 + i * 0.35, on(x.r)]); });
+      const cap = $("div", "caption reveal", `<h2>A whole shift in one file.</h2><p>Modes are prompts you write, not switches. Every worker gets its mode word for word.</p>`);
+      cap.style.left = "820px"; cap.style.bottom = "84px"; cap.style.maxWidth = "700px";
+      cap.querySelector("h2").style.fontSize = "40px";
+      root.append(cap); ev.push([ty.end + 2.4, on(cap)]);
+      return ev;
+    },
+  },
+  {
+    title: "Doctor", dur: 8,
+    build(root) {
+      const checks = $("div", "checks");
+      const els = ["Agents start without a prompt", "They can write state", "They can reach hc", "They can read Slack"]
+        .map((t) => { const c = $("div", "check", `<i>✓</i><span>${t}</span>`); checks.append(c); return c; });
+      const term = $("div", "doctor-term", "");
+      root.append(checks, term);
+      const lines = ["$ oncall-mc doctor", "  starting probe agent…", "  probe watcher+worker  <b>ok</b>", "  panel                 <b>ok</b>", "", `  ready: oncall-mc start --recipe ${D.recipe.name}`];
+      const ev = [];
+      lines.forEach((l, i) => ev.push([0.3 + i * 0.6, () => { term.innerHTML += l + "\n"; }]));
+      els.forEach((c, i) => ev.push([1.6 + i * 0.6, on(c)]));
+      const cap = $("div", "caption reveal", `<h2>Checked before your shift, not during a page.</h2>`);
+      cap.style.bottom = "84px"; root.append(cap); ev.push([4.6, on(cap)]);
+      return ev;
+    },
+  },
+  {
+    title: "Install", dur: 10,
+    build(root) {
+      const c = $("div", "close");
+      const h = $("h2", "reveal", `Give the night shift to agents.<br>Keep the <span>decisions</span>.`);
+      const inst = $("div", "install reveal", `<span>oncall-mc install</span>`);
+      const cap = $("p", "cap reveal", "Mission Control for Herdr. Watchers, workers, recipes and a panel that shows it all.");
+      c.append(h, inst, cap); root.append(c);
+      return [[0.3, on(h)], [1.5, on(inst)], [2.3, on(cap)]];
+    },
+  },
+];
+
+// ---------- player ----------
+const stage = document.getElementById("stage");
+const track = document.getElementById("track");
+const playBtn = document.getElementById("play");
+let ci = 0, t = 0, playing = true, events = [], fired = 0, last = null;
+
+chapters.forEach((ch, i) => {
+  const b = $("button", "tick", `<span>${ch.title}</span><span class="bar"><i></i></span>`);
+  b.style.setProperty("--w", Math.max(ch.dur, 9));
+  b.setAttribute("aria-label", `Chapter: ${ch.title}`);
+  b.onclick = () => load(i);
+  track.append(b);
+});
+
+function load(i) {
+  ci = (i + chapters.length) % chapters.length;
+  stage.innerHTML = "";
+  const root = $("div", "chapter");
+  stage.append(root);
+  events = chapters[ci].build(root).sort((a, b) => a[0] - b[0]);
+  fired = 0; t = 0;
+  [...track.children].forEach((b, j) => {
+    b.classList.toggle("now", j === ci);
+    b.querySelector("i").style.width = j < ci ? "100%" : "0";
+  });
+}
+
+function frame(now) {
+  if (last == null) last = now;
+  const dt = Math.min(0.1, (now - last) / 1000);
+  last = now;
+  if (playing) {
+    t += dt;
+    while (fired < events.length && events[fired][0] <= t) events[fired++][1]();
+    track.children[ci].querySelector("i").style.width = `${Math.min(100, (t / chapters[ci].dur) * 100)}%`;
+    if (t >= chapters[ci].dur) {
+      if (ci === chapters.length - 1) setPlaying(false); else load(ci + 1);
+    }
+  }
+  requestAnimationFrame(frame);
+}
+
+function setPlaying(p) {
+  playing = p;
+  playBtn.textContent = p ? "❚❚" : "▶";
+  playBtn.setAttribute("aria-label", p ? "Pause" : "Play");
+  if (p && ci === chapters.length - 1 && t >= chapters[ci].dur) load(0);
+}
+playBtn.onclick = () => setPlaying(!playing);
+addEventListener("keydown", (e) => {
+  if (e.key === " ") { e.preventDefault(); setPlaying(!playing); }
+  else if (e.key === "ArrowRight") load(ci + 1);
+  else if (e.key === "ArrowLeft") load(t > 1.5 ? ci : ci - 1);
+  else if (e.key.toLowerCase() === "r") { load(0); setPlaying(true); }
+});
+
+// Fit the 1600x900 stage to the window.
+function fit() {
+  const s = Math.min(innerWidth / 1600, innerHeight / 900);
+  document.getElementById("frame").style.transform = `scale(${s})`;
+}
+addEventListener("resize", fit); fit();
+
+// ?chapter=N&t=S jumps straight to a moment (for screenshots and links).
+const q = new URLSearchParams(location.search);
+load(Number(q.get("chapter") || 0));
+if (q.has("t")) { const target = Number(q.get("t")); while (fired < events.length && events[fired][0] <= target) events[fired++][1](); t = target; }
+if (q.has("pause")) setPlaying(false);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

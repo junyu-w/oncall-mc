@@ -1,0 +1,2137 @@
+#!/usr/bin/env python3
+"""oncall-mc: Mission Control for an on-call shift, in Herdr.
+
+An operator agent dispatches Slack watchers; watchers dispatch triage workers; a Herdr panel shows it all.
+Agents: run `oncall-mc guide` first. It explains how to set up, start, resume and end a shift.
+"""
+import argparse
+import fcntl
+import hashlib
+import secrets
+import json
+import os
+import re
+import shlex
+import shutil
+import textwrap
+import subprocess
+import sys
+import time
+from contextlib import contextmanager
+from pathlib import Path
+
+SIDE_INSTANCE = bool(os.environ.get("MC_ROOT"))  # a second instance or a test: never touch global links
+ROOT = Path(os.environ.get("MC_ROOT") or Path(__file__).resolve().parent.parent)
+STATE = ROOT / "state"
+PROMPTS = ROOT / "prompts"
+VERSION = "0.11.0"
+MC = str(ROOT / "bin/oncall-mc")
+HERDR_HOME = Path(os.environ.get("HERDR_APP_HOME") or Path.home() / ".config/herdr-app")
+MOD_NAME = "mission-control"
+USER_RECIPES = Path(os.environ.get("ONCALL_MC_RECIPES") or Path.home() / ".config/oncall-mc/recipes")
+SKILL_NAME = "oncall-mission-control"
+SHELLS = {"zsh", "bash", "sh", "fish", "dash", "ksh", "nu", "pwsh", "-zsh", "-bash"}
+OPERATOR_NAME = "mc-operator"
+
+# Overridable in state/config.json. Each command gets the agent's first message as its last argument.
+DEFAULT_CONFIG = {
+    "workdir": None,                       # set by `start` (default: the folder it was run from)
+    "operator_cmd": ["claude"],
+    "watcher_cmd": ["codex"],
+    "worker_cmd": ["codex"],
+    "max_active_workers": 3,
+}
+
+
+def config():
+    c = dict(DEFAULT_CONFIG)
+    c.update(read(STATE / "config.json") or {})
+    return c
+
+
+ACTIVE = {"queued", "triaging", "waiting", "needs-you"}
+STATUSES = ["queued", "triaging", "waiting", "needs-you", "done", "failed"]
+
+
+def now():
+    return int(time.time())
+
+
+def die(msg):
+    print(json.dumps({"error": msg}))
+    sys.exit(1)
+
+
+# ---------- storage ----------
+
+def ensure_dirs():
+    for d in (STATE / "watchers", STATE / "tasks"):
+        d.mkdir(parents=True, exist_ok=True)
+
+
+@contextmanager
+def locked():
+    ensure_dirs()
+    with open(STATE / ".lock", "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            write_board()
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def read(path):
+    try:
+        return json.loads(Path(path).read_text())
+    except FileNotFoundError:
+        return None
+
+
+def write(path, data):
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(path)
+
+
+def watcher_path(wid):
+    return STATE / "watchers" / f"{wid}.json"
+
+
+def task_path(tid):
+    return STATE / "tasks" / f"{tid}.json"
+
+
+# Only these names are records; agents may leave other files (evidence, exports) beside them.
+RECORD = {"tasks": (re.compile(r"^task-\d+(-\d+)?\.json$"), ("id", "watcher", "status")),
+          "watchers": (re.compile(r"^w-[a-z0-9-]+\.json$"), ("id", "channel", "status"))}
+
+
+def all_json(kind):
+    pattern, keys = RECORD[kind]
+    out = []
+    for p in sorted((STATE / kind).glob("*.json")):
+        if not pattern.match(p.name):
+            continue
+        try:
+            x = json.loads(p.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"oncall-mc: skipping unreadable {p}: {e}", file=sys.stderr)
+            continue
+        if not isinstance(x, dict) or any(k not in x for k in keys):
+            print(f"oncall-mc: skipping {p}: not a {kind[:-1]} record (needs {', '.join(keys)})", file=sys.stderr)
+            continue
+        out.append(x)
+    return sorted(out, key=lambda x: x.get("created_at", 0))
+
+
+def get_watcher(wid):
+    w = read(watcher_path(wid))
+    if not w:
+        die(f"no watcher {wid}")
+    return w
+
+
+def get_task(tid):
+    t = read(task_path(tid))
+    if not t:
+        die(f"no task {tid}")
+    return t
+
+
+def write_board():
+    board = {
+        "updated_at": now(),
+        "operator": read(STATE / "operator.json"),
+        "session": read(STATE / "session.json"),
+        "watchers": all_json("watchers"),
+        "tasks": all_json("tasks"),
+    }
+    write(STATE / "board.json", board)
+
+
+# ---------- hc ----------
+
+def hc(*args, check=True):
+    r = subprocess.run(["hc", args[0], "--json", *args[1:]], capture_output=True, text=True)
+    if check and r.returncode != 0:
+        die(f"hc {' '.join(args[:2])} failed: {r.stderr.strip() or r.stdout.strip()}")
+    try:
+        return json.loads(r.stdout) if r.stdout.strip() else {}
+    except json.JSONDecodeError:
+        return {"raw": r.stdout}
+
+
+def hc_get(target):
+    r = subprocess.run(["hc", "get", target, "--json"], capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    try:
+        return json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def is_live(target):
+    t = hc_get(target) if target else None
+    return bool(t and t.get("state") == "live")
+
+
+def agent_state(target):
+    t = hc_get(target)
+    if not t or t.get("state") != "live":
+        return None
+    s = t.get("status")
+    return (s.get("state") if isinstance(s, dict) else s) or "unknown"
+
+
+def launch(name, cmd, first_message, labels, parent=None, outlive=True):
+    args = ["run", "--bg", "--name", name, "--cwd", config()["workdir"] or str(Path.home())]
+    if outlive:
+        args.append("--outlive-parent")
+    for k, v in labels.items():
+        args += ["--label", f"{k}={v}"]
+    if parent == "none":
+        args.append("--no-parent")
+    elif parent:
+        args += ["--parent", parent]
+    argv = ["--", *cmd, *([first_message] if first_message else [])]
+    for n in range(2, 10):  # hc names are global: another session may still hold this one
+        r = subprocess.run(["hc", "run", "--json", *args[1:], *argv], capture_output=True, text=True)
+        if "name_taken" not in (r.stdout + r.stderr):
+            break
+        args[args.index("--name") + 1] = f"{name[:29]}-{n}"
+    if r.returncode != 0:
+        die(f"hc run failed: {r.stderr.strip() or r.stdout.strip()}")
+    out = json.loads(r.stdout)
+    addr = out.get("address")
+    if not addr:
+        die(f"hc run gave no address: {out}")
+    return addr
+
+
+def slug(text, n):
+    s = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return s[:n].strip("-") or "x"
+
+
+def caller():
+    return os.environ.get("HC_TERMINAL_ID")
+
+
+def operator_address():
+    op = read(STATE / "operator.json") or {}
+    return op.get("address")
+
+
+def notify_operator(text):
+    addr = operator_address()
+    if addr and is_live(addr):
+        subprocess.run(["hc", "send", addr, text], capture_output=True, text=True)
+        return True
+    return False
+
+
+def render(template, **values):
+    text = (PROMPTS / template).read_text()
+    for k, v in values.items():
+        text = text.replace("{{" + k + "}}", str(v))
+    return text
+
+
+# ---------- Herdr space ----------
+
+# ONCALL_MC_SPACE runs a second Mission Control beside the first (or a test) in its own space.
+_SPACE = re.sub(r"[^a-z0-9]", "", os.environ.get("ONCALL_MC_SPACE", "missioncontrol").lower()) or "missioncontrol"
+SPACE_ID, TAB_ID = f"sp{_SPACE}", f"tb{_SPACE}"
+SPACE_LABELS = {"herdr.space": SPACE_ID, "herdr.tab": TAB_ID}
+
+
+def herdr(*args):
+    try:
+        r = subprocess.run(["herdr-app", *args], capture_output=True, text=True, timeout=20)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        return {"error": str(e)}
+    try:
+        return json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return {"error": r.stderr.strip() or r.stdout.strip()}
+
+
+def herdr_spaces():
+    return herdr("ls").get("spaces")  # None when the app isn't reachable
+
+
+def find_pane(addr):
+    for sp in herdr_spaces() or []:
+        for tab in sp["tabs"]:
+            for t in tab["terminals"]:
+                if t["terminal"] == addr:
+                    return sp, t["pane"]
+    return None, None
+
+
+def show_space(addr, add_panel, switch):
+    """Puts the operator in the "Mission Control" space, with the panel pane beside it. Returns a note."""
+    spaces = herdr_spaces()
+    if spaces is None:
+        return "Herdr app not reachable: agents run, but open Herdr and run `oncall-mc resume` to see the space"
+    sess = session() or {}
+    add_panel = add_panel or not sess.get("panel")
+    subprocess.run(["hc", "label", addr, *[f"{k}={v}" for k, v in SPACE_LABELS.items()]], capture_output=True)
+    sp, pane = None, None
+    for _ in range(20):  # Herdr adopts the labelled terminal within a moment.
+        sp, pane = find_pane(addr)
+        if pane:
+            break
+        time.sleep(0.5)
+    if not pane:
+        return f"operator {addr} did not appear in Herdr"
+    if add_panel:
+        herdr("do", "space.rename", "--id", SPACE_ID, "--name", "Mission Control")
+        herdr("do", "pane.split", json.dumps({"pane": pane, "direction": "right", "mod": MOD_NAME,
+                                              "props": {"state": str(STATE)}}))
+        if sess:
+            sess["panel"] = True
+            write(STATE / "session.json", sess)
+    if switch:
+        herdr("do", "space.select", "--id", SPACE_ID)
+    return "panel added" if add_panel else "space ready"
+
+
+# ---------- liveness ----------
+
+def program_alive(addr):
+    """The terminal is live AND still runs its program (a kept terminal can come back as a bare shell)."""
+    t = hc_get(addr) if addr else None
+    if not t or t.get("state") != "live":
+        return False
+    argv = (t.get("foreground") or {}).get("argv") or t.get("argv") or [""]
+    return os.path.basename(argv[0]) not in SHELLS
+
+
+def retire(addr):
+    """Ends a terminal that lost its program (or is being replaced)."""
+    if addr and is_live(addr):
+        subprocess.run(["hc", "kill", addr], capture_output=True)
+
+
+# ---------- session ----------
+
+SESSION_FILES = ["watchers", "tasks", "counter", "operator.json", "operator.md", "session.json", "recipe.json"]
+
+
+def session():
+    s = read(STATE / "session.json")
+    if not s and (STATE / "operator.json").exists():  # state from before sessions existed
+        op = read(STATE / "operator.json")
+        s = {"id": time.strftime("%Y%m%d-%H%M", time.localtime(op.get("created_at", now()))),
+             "name": None, "started_at": op.get("created_at", now()), "ended_at": None, "panel": True}
+        write(STATE / "session.json", s)
+    return s
+
+
+def session_terminals():
+    """(role, id, address) for everything this session started."""
+    out = []
+    op = read(STATE / "operator.json") or {}
+    if op.get("address"):
+        out.append(("operator", "operator", op["address"]))
+    for w in all_json("watchers"):
+        for role, key in (("ticker", "ticker"), ("watcher", "address")):
+            if w.get(key):
+                out.append((role, w["id"], w[key]))
+    for t in all_json("tasks"):
+        if (t.get("worker") or {}).get("address"):
+            out.append(("worker", t["id"], t["worker"]["address"]))
+    return out
+
+
+def live_session_terminals():
+    return [x for x in session_terminals() if program_alive(x[2])]
+
+
+def archive_session():
+    s = session()
+    if not s:
+        return None
+    dest = STATE / "archive" / s["id"]
+    n = 2
+    while dest.exists():
+        dest, n = STATE / "archive" / f"{s['id']}-{n}", n + 1
+    dest.mkdir(parents=True)
+    for name in SESSION_FILES:
+        if (STATE / name).exists():
+            shutil.move(str(STATE / name), str(dest / name))
+    return str(dest)
+
+
+def save_workdir(workdir):
+    c = read(STATE / "config.json") or {}
+    if workdir or not c.get("workdir"):
+        c["workdir"] = str(Path(workdir or os.getcwd()).resolve())
+    write(STATE / "config.json", {**DEFAULT_CONFIG, **c})
+
+
+# ---------- models and effort ----------
+# How each agent CLI takes a model and a reasoning effort. Others can be added in config.json "agent_flags".
+AGENT_FLAGS = {
+    "codex": {"model": ["-m", "{model}"], "effort": ["-c", "model_reasoning_effort={effort}"]},
+    "claude": {"model": ["--model", "{model}"], "effort": ["--effort", "{effort}"]},
+}
+
+
+def agent_flags():
+    return {**AGENT_FLAGS, **(config().get("agent_flags") or {})}
+
+
+def agent_kind(cmd):
+    name = os.path.basename(cmd[0]).lower() if cmd else ""
+    return next((k for k in agent_flags() if k in name), None)
+
+
+def spec(model=None, effort=None):
+    return {"model": model, "effort": effort} if (model or effort) else None
+
+
+def merge_specs(*specs):
+    """Field by field, the first spec that sets it wins."""
+    out = {}
+    for f in ("model", "effort"):
+        out[f] = next((x[f] for x in specs if x and x.get(f)), None)
+    return out if any(out.values()) else None
+
+
+def with_agent(cmd, sp):
+    """The command with its model/effort flags replaced by `sp`. Unchanged when sp is empty."""
+    if not sp:
+        return list(cmd)
+    kind = agent_kind(cmd)
+    if not kind:
+        die(f"oncall-mc does not know how to set a model or effort for {cmd[0]!r}. Add it to config.json, e.g. "
+            '"agent_flags": {"<name>": {"model": ["--model", "{model}"], "effort": ["--effort", "{effort}"]}}')
+    out, skip, toks = [], 0, list(cmd)
+    for i, tok in enumerate(toks):
+        if skip:
+            skip -= 1
+            continue
+        nxt = toks[i + 1] if i + 1 < len(toks) else ""
+        if sp.get("model") and (tok in ("-m", "--model") or tok.startswith("--model=")):
+            skip = 0 if "=" in tok else 1
+            continue
+        if sp.get("effort") and (tok == "--effort" or tok.startswith("--effort=")):
+            skip = 0 if "=" in tok else 1
+            continue
+        if sp.get("effort") and tok == "-c" and nxt.startswith("model_reasoning_effort="):
+            skip = 1
+            continue
+        out.append(tok)
+    flags = agent_flags()[kind]
+    for f in ("model", "effort"):
+        if sp.get(f):
+            out += [x.replace("{" + f + "}", sp[f]) for x in flags[f]]
+    return out
+
+
+def recipe_agent(role):
+    return ((read(STATE / "recipe.json") or {}).get("agents") or {}).get(role)
+
+
+def worker_spec(explicit=None, watcher=None, mode=None):
+    mode_agents = (read(STATE / "recipe.json") or {}).get("mode_agents") or {}
+    return merge_specs(explicit, (watcher or {}).get("worker_agent"), mode_agents.get(mode) if mode else None, recipe_agent("worker"))
+
+
+def launch_operator(resumed):
+    brief = STATE / "operator.md"
+    rec = read(STATE / "recipe.json")
+    brief.write_text(render("OPERATOR.md", mc=MC) + recipe_operator_section(rec))
+    if resumed:
+        first = (f"You are the Mission Control operator, restarted after an interruption. Read {brief} and follow it. "
+                 f"Then run `{MC} status` and give the user a catch-up of at most 4 lines.")
+    else:
+        first = f"You are the Mission Control operator. Read {brief} and follow it. Then reply with one line: ready."
+    addr = launch(OPERATOR_NAME, with_agent(config()["operator_cmd"], recipe_agent("operator")), first, {"mc.role": "operator", **SPACE_LABELS},
+                  parent="none")
+    write(STATE / "operator.json", {"address": addr, "name": OPERATOR_NAME, "created_at": now()})
+    return addr
+
+
+def launch_watcher(w, resumed):
+    brief = STATE / "watchers" / f"{w['id']}.md"
+    if resumed:
+        first = (f"You are Mission Control watcher {w['id']}, restarted after an interruption. Read {brief} and follow it. "
+                 f"Your cursor and tasks are in `{MC} watcher show {w['id']}`. Run one watch cycle now.")
+    else:
+        first = f"You are Mission Control watcher {w['id']}. Read {brief} and follow it. Start with one watch cycle now."
+    w["address"] = launch(w["id"], with_agent(config()["watcher_cmd"], w.get("agent")), first, {"mc.role": "watcher", "mc.watcher": w["id"]},
+                          parent=operator_address() or caller())
+    launch_ticker(w)
+
+
+def launch_ticker(w):
+    w["ticker"] = launch(f"{w['id'][:25]}-tick", [sys.executable, MC, "tick", w["id"]], "", {"mc.role": "ticker"},
+                         parent=w["address"], outlive=False)
+
+
+def cmd_start(a):
+    ensure_dirs()
+    rec = None
+    if a.recipe:
+        rec, problems = load_recipe(a.recipe)
+        if problems:
+            die(f"{rec['path']}: " + "; ".join(problems))
+    d = read(STATE / DOCTOR)
+    if not a.skip_doctor and not (d and d.get("ok") and d.get("config") == agent_config_hash(rec)):
+        die(f"run `oncall-mc doctor{' --recipe ' + a.recipe if a.recipe else ''}` first: it checks that unattended agents "
+            "can run without prompts, write state and read Slack with every agent command and model this start would use. "
+            "(--skip-doctor starts anyway.)")
+    with locked():
+        live = live_session_terminals()
+        if live and not a.replace:
+            die(f"a session is running ({len(live)} live agents). Run `oncall-mc resume` to continue it, or ask the "
+                "user before `oncall-mc start --replace`, which stops every agent of that session and archives it.")
+        stop_all(live)
+        archived = archive_session()
+        if any(sp["id"] == SPACE_ID for sp in herdr_spaces() or []):  # leftover space: start clean
+            herdr("do", "space.close", "--id", SPACE_ID, "--confirmed", "true")
+        ensure_dirs()
+        recipe_workdir = str(Path(rec["workdir"]).expanduser()) if rec and rec.get("workdir") else None
+        save_workdir(a.workdir or recipe_workdir)
+        s = {"id": time.strftime("%Y%m%d-%H%M"), "name": a.name or (rec or {}).get("name"), "started_at": now(),
+             "ended_at": None, "recipe": (rec or {}).get("name")}
+        write(STATE / "session.json", s)
+        started, skipped = [], []
+        if rec:
+            write(STATE / "recipe.json", {"name": rec["name"], "description": rec["description"],
+                                          "operator": rec["operator"], "modes": rec["modes"],
+                                          "agents": rec["agents"], "mode_agents": rec["mode_agents"],
+                                          "summary": rec["summary"]})
+        addr = launch_operator(resumed=False)
+        if rec:
+            started, skipped = apply_recipe(rec)
+    note = show_space(addr, add_panel=False, switch=not a.no_switch)
+    print(json.dumps({"session": s["id"], "operator": addr, "recipe": (rec or {}).get("name"), "watchers": started,
+                      "skipped": skipped, "archived_previous": archived, "herdr": note}))
+
+
+def cmd_resume(a):
+    ensure_dirs()
+    report = {"kept": [], "restarted": [], "skipped": []}
+    with locked():
+        s = session()
+        if not s:
+            die("no session to resume. Run `oncall-mc start`.")
+        if a.workdir:
+            save_workdir(a.workdir)
+        op = read(STATE / "operator.json") or {}
+        addr = op.get("address")
+        if program_alive(addr):
+            report["kept"].append(f"operator {addr}")
+        else:
+            retire(addr)
+            addr = launch_operator(resumed=True)
+            report["restarted"].append(f"operator {addr}")
+        for w in all_json("watchers"):
+            if w["status"] == "stopped":
+                continue
+            if program_alive(w.get("address")):
+                report["kept"].append(f"{w['id']} {w['address']}")
+                if not program_alive(w.get("ticker")):
+                    retire(w.get("ticker"))
+                    launch_ticker(w)
+                    report["restarted"].append(f"{w['id']} ticker {w['ticker']}")
+            else:
+                retire(w.get("ticker"))
+                retire(w.get("address"))
+                launch_watcher(w, resumed=True)
+                report["restarted"].append(f"{w['id']} {w['address']}")
+            w["status"] = "running"
+            write(watcher_path(w["id"]), w)
+        for t in all_json("tasks"):
+            worker = (t.get("worker") or {}).get("address")
+            if t["status"] not in ACTIVE or not worker:
+                continue
+            if program_alive(worker):
+                report["kept"].append(f"{t['id']} {worker}")
+            elif t["status"] == "triaging":
+                retire(worker)
+                resume_worker(t)
+                write(task_path(t["id"]), t)
+                report["restarted"].append(f"{t['id']} {t['worker']['address']}")
+            else:
+                report["skipped"].append(f"{t['id']} ({t['status']}, worker gone; `task dispatch` to restart)")
+    report["herdr"] = show_space(addr, add_panel=a.panel, switch=not a.no_switch)
+    report["session"] = s["id"]
+    print(json.dumps(report, indent=2))
+
+
+def resume_worker(t):
+    w = read(watcher_path(t["watcher"])) if t["watcher"] != "operator" else None
+    parent = (w or {}).get("address") or operator_address()
+    brief_file = STATE / "tasks" / f"{t['id']}.md"
+    report = STATE / "tasks" / f"{t['id']}.report.md"
+    first = (f"You are Mission Control worker {t['id']}, restarted after an interruption. Read {brief_file} and follow it. "
+             f"Read {report} (if present) and the source thread first: do not repeat work or Slack posts that already exist.")
+    addr = launch(t["id"], with_agent(config()["worker_cmd"], t.get("agent")), first,
+                  {"mc.role": "worker", "mc.task": t["id"], "mc.watcher": t["watcher"]}, parent=parent)
+    t["worker"] = {"name": t["id"], "address": addr}
+    t["history"].append({"at": now(), "status": t["status"], "note": f"worker restarted as {addr}"})
+
+
+def stop_all(terminals):
+    for _role, _id, addr in terminals:
+        subprocess.run(["hc", "kill", addr], capture_output=True)
+
+
+def cmd_end(a):
+    ensure_dirs()
+    s = session()
+    if not s:
+        die("no session to end")
+    terminals = live_session_terminals()
+    if not a.yes:
+        die(f"this stops {len(terminals)} agents ({', '.join(f'{r} {i}' for r, i, _ in terminals) or 'none'}), "
+            "archives the session and closes the Mission Control space. Confirm with the user, then add --yes.")
+    with locked():
+        stop_all(terminals)
+        s["ended_at"] = now()
+        write(STATE / "session.json", s)
+        archived = archive_session()
+    if herdr_spaces() is not None:
+        herdr("do", "space.close", "--id", SPACE_ID, "--confirmed", "true")
+    print(json.dumps({"ended": s["id"], "stopped": len(terminals), "archive": archived}))
+
+
+def cmd_tell(a):
+    if not notify_operator(a.message):
+        die("the operator is not running. Run `oncall-mc resume`.")
+    print(json.dumps({"sent": True, "operator": operator_address()}))
+
+
+def install_skill():
+    """Links the agent skill into every agent skills folder that exists, so a bare
+    "set up oncall mission control" finds this tool."""
+    src = ROOT / "skills" / SKILL_NAME
+    done = []
+    for base in (Path.home() / ".claude/skills", Path.home() / ".agents/skills", Path.home() / ".codex/skills"):
+        if not base.is_dir():
+            continue
+        dest = base / SKILL_NAME
+        if dest.is_symlink():
+            dest.unlink()
+        elif dest.exists():
+            done.append(f"kept existing {dest} (not a link)")
+            continue
+        dest.symlink_to(src)
+        done.append(str(dest))
+    return done or "no agent skills folder found (~/.claude/skills, ~/.agents/skills, ~/.codex/skills)"
+
+
+# ---------- config ----------
+
+def cmd_config(a):
+    """Shows or sets the agent commands. Setting them marks the config as reviewed by the user."""
+    ensure_dirs()
+    c = {**DEFAULT_CONFIG, **(read(STATE / "config.json") or {})}
+    changed = False
+    for key, val in (("operator_cmd", a.operator), ("watcher_cmd", a.watcher), ("worker_cmd", a.worker)):
+        if val is not None:
+            c[key] = shlex.split(val)
+            changed = True
+    if a.workdir:
+        c["workdir"] = str(Path(a.workdir).expanduser().resolve())
+        changed = True
+    if a.max_workers:
+        c["max_active_workers"] = a.max_workers
+        changed = True
+    if changed or a.reviewed:
+        c["reviewed"] = True
+        write(STATE / "config.json", c)
+    print(json.dumps({"config": str(STATE / "config.json"), **c}, indent=2))
+
+
+# ---------- doctor: prove unattended agents can work before a shift ----------
+
+DOCTOR = "doctor.json"
+PROBE_DIR = "probe"
+
+
+def probe_commands(rec=None):
+    """(label, command) for every distinct watcher/worker command a session (with this recipe) would run."""
+    c = config()
+    found = {}
+
+    def add(label, cmd):
+        found.setdefault(tuple(cmd), label)
+
+    if not rec:
+        add("watcher", c["watcher_cmd"])
+        add("worker", c["worker_cmd"])
+    else:
+        ag, ma = rec.get("agents") or {}, rec.get("mode_agents") or {}
+        add("worker", with_agent(c["worker_cmd"], ag.get("worker")))
+        for name, msp in ma.items():  # direct tasks may use any mode
+            ksp = merge_specs(msp, ag.get("worker"))
+            add(f"worker {(ksp or {}).get('model') or ''} {(ksp or {}).get('effort') or ''} ({name})".strip(), with_agent(c["worker_cmd"], ksp))
+        for w in rec["watchers"]:
+            if not w["enabled"]:
+                continue
+            wsp = merge_specs(w["agent"], ag.get("watcher"))
+            add(f"watcher {wsp['model'] if wsp else ''} {(wsp or {}).get('effort') or ''}".strip(), with_agent(c["watcher_cmd"], wsp))
+            ksp = merge_specs(w["worker_agent"], ma.get(w["mode"]) if w["mode"] else None, ag.get("worker"))
+            add(f"worker {ksp['model'] if ksp else ''} {(ksp or {}).get('effort') or ''}".strip(), with_agent(c["worker_cmd"], ksp))
+    return [(label, list(cmd)) for cmd, label in found.items()]
+
+
+def agent_config_hash(rec=None):
+    c = config()
+    op = with_agent(c["operator_cmd"], (rec or {}).get("agents", {}).get("operator")) if rec else c["operator_cmd"]
+    cmds = sorted(json.dumps(cmd) for _l, cmd in probe_commands(rec))
+    return hashlib.sha256(json.dumps([op, cmds]).encode()).hexdigest()[:16]
+
+
+def screen_tail(addr, n=12):
+    r = subprocess.run(["hc", "read", addr, "--lines", "0"], capture_output=True, text=True)
+    lines = [ln.rstrip() for ln in r.stdout.splitlines() if ln.strip()]
+    return "\n".join(lines[-n:])
+
+
+def static_checks():
+    out = {}
+    for tool in ("hc", "herdr-app", "git"):
+        out[tool] = (True, shutil.which(tool)) if shutil.which(tool) else (False, f"{tool} is not on PATH")
+    out["herdr app"] = (True, "reachable") if herdr_spaces() is not None else (False, "Herdr app not reachable: open it")
+    try:
+        import tomllib  # noqa: F401
+        out["python"] = (True, sys.version.split()[0])
+    except ImportError:
+        out["python"] = (True, f"{sys.version.split()[0]}: TOML recipes need 3.11+; JSON recipes work")
+    mod = HERDR_HOME / "mods" / MOD_NAME / "main.js"
+    same = mod.exists() and mod.read_bytes() == (ROOT / "mods" / MOD_NAME / "main.js").read_bytes()
+    out["panel"] = (True, "installed") if same else (False, "panel missing or outdated: run `oncall-mc install`")
+    out["agent commands"] = (True, "reviewed") if config().get("reviewed", True) else (
+        False, "not reviewed yet: ask the user which commands and flags to use, then "
+               "`oncall-mc config --operator '...' --watcher '...' --worker '...'` (or `--reviewed` to keep them)")
+    for key in ("operator_cmd", "watcher_cmd", "worker_cmd"):
+        exe = (config().get(key) or [""])[0]
+        ok = bool(shutil.which(exe) or Path(exe).exists())
+        out[key] = (ok, " ".join(config()[key]) if ok else f"{exe} not found: fix {key} in {STATE / 'config.json'}")
+    return out
+
+
+def cmd_probe(a):
+    """Run by a doctor probe agent: proves it can run oncall-mc, write state and reach hc without a prompt."""
+    (STATE / PROBE_DIR).mkdir(parents=True, exist_ok=True)
+    hc_ok = subprocess.run(["hc", "ls", "--json"], capture_output=True).returncode == 0
+    write(STATE / PROBE_DIR / f"{a.token}.json", {"at": now(), "hc": hc_ok, "slack": a.slack, "cwd": os.getcwd()})
+    print("probe recorded. Reply with one line: probe done.")
+
+
+def cmd_doctor(a):
+    ensure_dirs()
+    rec = None
+    if a.recipe:
+        rec, problems = load_recipe(a.recipe)
+        if problems:
+            die(f"{rec['path']}: " + "; ".join(problems))
+    pdir = STATE / PROBE_DIR
+    pdir.mkdir(parents=True, exist_ok=True)
+    report = {k: ("ok: " if ok else "FAIL: ") + msg for k, (ok, msg) in static_checks().items()}
+    static_ok = all(v.startswith("ok") for v in report.values())
+    pending = read(pdir / "pending.json")
+    if pending and (a.restart or pending["config"] != agent_config_hash(rec)):
+        for pr in pending["probes"]:
+            retire(pr["address"])
+        pending = None
+    if not pending:
+        if not static_ok:
+            print(json.dumps({"ok": False, **report, "next": "fix the FAIL items, then run `oncall-mc doctor` again"}, indent=2))
+            sys.exit(1)
+        roles = probe_commands(rec)
+        probes = []
+        for role, cmd in roles:
+            token = secrets.token_hex(4)
+            first = (f"This is an oncall-mc preflight check, not real work. Do exactly this and nothing else. "
+                     f"1) Check whether you have a tool that can read Slack channels (an MCP server or an app connector). "
+                     f"2) Run this shell command: {MC} probe {token} --slack yes   (use --slack no if you have no Slack tool). "
+                     f"3) Reply with one line: probe done.")
+            addr = launch(f"mc-probe-{slug(role, 20)}", cmd, first, {"mc.role": "probe"}, parent="none")
+            probes.append({"role": role, "token": token, "address": addr, "started": now(), "seen_working": False})
+        pending = {"config": agent_config_hash(rec), "probes": probes}
+    deadline = time.time() + a.wait
+    while True:
+        for pr in pending["probes"]:
+            if pr.get("result"):
+                continue
+            res = read(pdir / f"{pr['token']}.json")
+            st = agent_state(pr["address"])
+            if st == "working":
+                pr["seen_working"] = True
+            if res:
+                problems = ([] if res["hc"] else ["it cannot reach hc (sandbox or permissions)"]) + \
+                           ([] if res["slack"] == "yes" else ["it has no Slack tool"])
+                pr["result"] = "ok" if not problems else "FAIL: " + "; ".join(problems)
+            elif st == "blocked":
+                pr["result"] = ("FAIL: the agent stopped at a prompt. Unattended agents need flags that skip approval "
+                                "prompts. Screen:\n" + screen_tail(pr["address"]))
+            elif st is None:
+                pr["result"] = "FAIL: the agent exited at startup. Screen:\n" + screen_tail(pr["address"])
+            elif now() - pr["started"] > 300:
+                pr["result"] = ("FAIL: no probe result after 5 minutes. The command may not be an interactive agent, "
+                                "or it is stuck. Screen:\n" + screen_tail(pr["address"]))
+            elif st in ("idle", "done") and pr["seen_working"] and now() - pr["started"] > 30:
+                pr["result"] = ("FAIL: the agent finished without recording the probe. It probably cannot run "
+                                f"{MC} or write to {STATE} (a sandbox that blocks writes outside its folder?). Screen:\n"
+                                + screen_tail(pr["address"]))
+        if all(pr.get("result") for pr in pending["probes"]) or time.time() > deadline:
+            break
+        time.sleep(3)
+    write(pdir / "pending.json", pending)
+    for pr in pending["probes"]:
+        report[f"probe {pr['role']}"] = pr.get("result") or "pending: the agent is still working. Run `oncall-mc doctor` again."
+    done = all(pr.get("result") for pr in pending["probes"])
+    ok = static_ok and done and all(pr["result"] == "ok" for pr in pending["probes"])
+    if done:
+        for pr in pending["probes"]:
+            retire(pr["address"])
+            subprocess.run(["hc", "rm", pr["address"]], capture_output=True)
+            (pdir / f"{pr['token']}.json").unlink(missing_ok=True)
+        (pdir / "pending.json").unlink(missing_ok=True)
+        write(STATE / DOCTOR, {"ok": ok, "config": pending["config"], "at": now(), "report": report})
+    report["ok"] = ok
+    report["next"] = ("ready: `oncall-mc start [--recipe <name>]`" if ok else
+                      "probes still running: run `oncall-mc doctor` again in a minute" if not done else
+                      f"fix the FAIL items (agent commands live in {STATE / 'config.json'}), then `oncall-mc doctor --restart`")
+    print(json.dumps(report, indent=2))
+    sys.exit(0 if ok else 2 if not done else 1)
+
+
+def cmd_install(a):
+    checks = {}
+    for tool in ("hc", "herdr-app"):
+        checks[tool] = shutil.which(tool) or "MISSING"
+    ensure_dirs()
+    c = read(STATE / "config.json")
+    if not c:
+        c = dict(DEFAULT_CONFIG)
+        if not shutil.which("codex") and shutil.which("claude"):
+            c["watcher_cmd"] = c["worker_cmd"] = ["claude"]
+        c["reviewed"] = False  # the user has not approved these commands yet; see `oncall-mc config`
+        write(STATE / "config.json", c)
+        checks["config"] = f"created {STATE / 'config.json'}"
+    else:
+        checks["config"] = f"kept {STATE / 'config.json'}"
+    for key in ("operator_cmd", "watcher_cmd", "worker_cmd"):
+        exe = (c.get(key) or [""])[0]
+        checks[key] = " ".join(c[key]) if shutil.which(exe) or Path(exe).exists() else f"MISSING: {exe}"
+    mod_dir = HERDR_HOME / "mods" / MOD_NAME
+    if HERDR_HOME.exists():
+        mod_dir.mkdir(parents=True, exist_ok=True)
+        for f in ("main.js", "mod.json"):
+            shutil.copy2(ROOT / "mods" / MOD_NAME / f, mod_dir / f)
+        r = subprocess.run(["herdr-app", "check", str(mod_dir)], capture_output=True, text=True)
+        checks["panel"] = (r.stdout.strip() or r.stderr.strip()) if r.returncode == 0 else f"CHECK FAILED: {r.stderr.strip() or r.stdout.strip()}"
+    else:
+        checks["panel"] = f"MISSING: no Herdr app home at {HERDR_HOME}"
+    bin_dir = Path.home() / ".local/bin"
+    link = bin_dir / "oncall-mc"
+    if a.no_link or SIDE_INSTANCE:
+        checks["path"] = "skipped" + (" (MC_ROOT is set: a side instance leaves the main install's link alone)" if SIDE_INSTANCE else "")
+    elif bin_dir.is_dir():
+        if link.is_symlink() or not link.exists():
+            if link.is_symlink():
+                link.unlink()
+            link.symlink_to(MC)
+            checks["path"] = f"{link} -> {MC}" + ("" if str(bin_dir) in os.environ.get("PATH", "") else " (add ~/.local/bin to PATH)")
+        else:
+            checks["path"] = f"kept existing {link} (not a symlink)"
+    else:
+        checks["path"] = f"no {bin_dir}; call {MC} directly"
+    checks["skill"] = "skipped (MC_ROOT is set)" if SIDE_INSTANCE else install_skill()
+    checks["next"] = ("Ask the user which agent commands and flags to use (unattended agents need flags that skip "
+                      "approval prompts), set them with `oncall-mc config --operator '...' --watcher '...' --worker '...'`, "
+                      "then run `oncall-mc doctor` until it passes. Then `oncall-mc start`.")
+    print(json.dumps(checks, indent=2))
+
+
+GUIDE = """\
+# oncall-mc: Mission Control for an on-call shift
+
+Read all of this before you run a command. It is the manual for agents that set up and run Mission Control
+on behalf of the user (the on-call engineer).
+
+## What it is
+
+Mission Control is a space in the Herdr app called "Mission Control". It has two panes:
+- Left: the **operator**, an agent that the user talks to.
+- Right: the **panel**, which shows every watcher with its stats, and the tasks under each watcher.
+
+The agents:
+- **Operator**: starts watchers and direct tasks when the user asks. It relays only what needs the user.
+- **Watcher**: watches one Slack channel. It wakes every `--interval` seconds, but only while it is idle.
+  It starts a worker for each item of interest.
+- **Worker**: triages one item, in this order: impact, then root cause, then mitigation. It keeps its task
+  current on the panel and reports to its watcher.
+
+The user clicks a watcher or task in the panel to open its live terminal.
+All agents are herdr-core (`hc`) terminals. They keep running when the Herdr window closes, but stop when
+the machine sleeps or restarts.
+
+You are not the operator. Your job is the session lifecycle. Pass on-call requests to the operator
+(see `tell` below).
+
+## Setting up from a prompt
+
+Users often ask in one sentence, for example "set up oncall mission control" or "start mission control with
+this recipe: ...". Do these steps in order, and skip any that are already done:
+
+1. **Install.** If `oncall-mc` is not on PATH, it is not installed. Ask the user for the repository URL, clone it
+   to `~/.local/share/oncall-mc`, then run `~/.local/share/oncall-mc/bin/oncall-mc install`.
+   On an existing install, run `oncall-mc install` anyway. It is safe to repeat, and it updates the panel and
+   the agent skill. Report any MISSING item to the user.
+2. **Agent commands.** These are in `state/config.json` (`install` prints the path):
+   - `operator_cmd`, `watcher_cmd`, `worker_cmd`: the agent commands. Each command gets the agent's first
+     message as its last argument.
+   - `workdir`: the folder that agents start in.
+   - `max_active_workers`
+
+   Watchers and workers run unattended, so their commands need the flags that stop approval prompts. Their
+   sandbox must also allow writes to the state folder and access to `hc`. Ask the user which model and
+   approval flags to use. Never invent flags. Do not run doctor before the user answers.
+   Set the commands with `oncall-mc config --operator '<cmd>' --watcher '<cmd>' --worker '<cmd>'`. If the user
+   keeps the commands shown by `oncall-mc config`, run `oncall-mc config --reviewed`. Doctor refuses
+   commands that nobody has reviewed.
+3. **Doctor.** Run `oncall-mc doctor`. It starts a throwaway agent with each configured command and checks four
+   things: the agent starts without a prompt, it runs oncall-mc, it writes state, and it has a Slack tool.
+   - If doctor says pending, run it again.
+   - If it fails, show the user the FAIL line, fix the config with them, and run `oncall-mc doctor --restart`.
+   - `start` refuses until doctor passes.
+4. **Recipe.** If the user pasted one, save it:
+   `oncall-mc recipe add <name> <<'EOF'` followed by the pasted text and `EOF`. It accepts TOML or JSON.
+   If they described a recipe in words, write one from `<root>/recipes/example.toml` and confirm it with them.
+   Save it the same way. `recipe add` validates the recipe and refuses one with problems: fix them and retry.
+5. **Start.** Run `oncall-mc start --recipe <name>`, or `oncall-mc start` without a recipe.
+6. **Report back** to the user, in a few lines:
+   - Which watchers started.
+   - Where to talk to the operator: the left pane of the "Mission Control" space.
+   - That the panel is on the right.
+
+## After an install: tell the user how to use it
+
+If the user asked only to install, or asked how to use it, reply with a short summary, under 15 lines. Do
+not start a session unless they asked for one. Cover these points:
+- **Where it lives:** Mission Control runs in a "Mission Control" space in Herdr. They talk to the operator in
+  its left pane, and the panel on the right shows watchers and tasks. A click on any row opens that agent.
+- **One setup step:** before the first shift, they pick the agent commands and flags (`oncall-mc config`), and
+  `oncall-mc doctor` has to pass. Offer to do this with them now.
+- **Prompts that work in any agent session from now on:**
+  - "Start oncall mission control for my shift." They can add "with my <name> recipe", or paste a recipe.
+  - "Write me a recipe for <channels>." You can write one from `<root>/recipes/example.toml`.
+  - "Resume mission control." For use after a restart or a crash.
+  - "What is mission control doing?"
+  - "End my shift."
+- **Prompts for the operator,** once a shift is running:
+  - "Watch #channel for <what matters>; <what workers may do>."
+  - "Look into <X>."
+  - "Check #x every 5 minutes."
+  - "Brief me on task-012." The panel's "Brief me" button does the same.
+  - "Give task-012 to the #y watcher."
+
+## Session lifecycle
+
+Use one session per shift. Each command prints JSON.
+
+| The user says | You run |
+|---|---|
+| "start mission control for my on-call shift" | `oncall-mc start [--recipe <name>] [--name '<shift label>'] [--workdir <repo>]` |
+| "start mission control with my <x> recipe" | `oncall-mc start --recipe <x>` |
+| "add the <x> recipe to mission control" | `oncall-mc recipe apply <x>` |
+| "check mission control can run" | `oncall-mc doctor` |
+| "summarize my shift" | `oncall-mc summary [--since 2026-11-03]` (before `end`: it needs the operator) |
+| "resume mission control" / "bring it back" (after a restart or crash, or to re-show it) | `oncall-mc resume` |
+| "what's mission control doing" | `oncall-mc status` |
+| "end my shift" / "shut mission control down" | `oncall-mc end` (it asks for confirmation; see below) |
+| something for the operator ("watch #x for ...", "look into Y") | `oncall-mc tell '<the user's request, verbatim>'` |
+
+- **`start`**
+  - Archives the previous session under `state/archive/`.
+  - Starts a fresh operator in the Mission Control space and switches Herdr to that space.
+  - If a session still has live agents, `start` refuses. In that case, ask the user whether to resume it,
+    or to replace it: `start --replace` stops every agent of the old session.
+  - `--workdir` defaults to the current folder the first time, and is remembered after that.
+- **`resume`**
+  - Brings back everything that died, and keeps what is alive:
+    - the operator
+    - watchers and their tickers (each watcher continues from its saved Slack cursor)
+    - workers on tasks that are still triaging (each restarted worker reads its report first, so it does not
+      repeat its Slack posts)
+  - It also re-shows the space. `--panel` adds the panel again if the user closed it.
+  - It prints what it kept and what it restarted. Relay that to the user in a few lines.
+- **`end`**
+  - Stops every agent of the session, archives the session and closes the space.
+  - Without `--yes`, it only lists what it would stop. Show that list to the user, get a clear yes,
+    then run `oncall-mc end --yes`.
+- **`status`**: the operator, the watchers and the open tasks, flagged (!) where the user is needed.
+  `--json` gives the full board.
+
+After `start`, tell the user:
+- Mission Control is open in the "Mission Control" space.
+- They talk to the operator in its left pane.
+- An example request: "create a watcher for #alerts-channel for pages assigned to me".
+
+If they gave you watcher requests up front, pass each one on with `oncall-mc tell` once the operator
+reports ready (`hc wait <operator address>`).
+
+## Recipes
+
+A recipe is a file that bootstraps a shift. It holds:
+- **Named worker modes.** Each mode is a prompt that says what workers may do, for example triage only,
+  triage and reply in the thread, or fix and open a draft PR.
+- **Standing instructions** for the operator.
+- **The watchers to start.** Each watcher has a channel, channel ID, interval, lookback, mode, `interest`,
+  and optionally `escalate` and `notes`.
+
+oncall-mc attaches a watcher's mode prompt to every worker brief, so the mode is applied word for word.
+
+A recipe can also choose models and reasoning effort:
+- **Per role:** `[agents.operator]`, `[agents.watcher]`, `[agents.worker]`, each with `model` and `effort`.
+- **Per mode:** a mode can set `model` and `effort` for its workers.
+- **Per watcher:** `model` and `effort` for the watcher itself, and `worker_model` and `worker_effort` for its
+  workers.
+
+A worker's model and effort come from, in order: `task new --model/--effort`, its watcher, its mode, then
+`[agents.worker]`. oncall-mc swaps them into the configured command with each CLI's own flags.
+`oncall-mc doctor --recipe <name>` probes every combination; `start --recipe` requires that.
+
+- `oncall-mc recipe ls` lists recipes. It searches `~/.config/oncall-mc/recipes/` (personal recipes) and
+  `<root>/recipes/` (shipped examples).
+- `oncall-mc recipe add <name>` saves a recipe from stdin or `--file`, after validating it.
+- `oncall-mc recipe show <name>` shows a recipe. `oncall-mc recipe check <name>` validates it and lists
+  every problem.
+- `oncall-mc start --recipe <name>` starts the operator and the recipe's watchers.
+  `oncall-mc recipe apply <name>` adds them to the running session, and skips channels already watched.
+- `oncall-mc modes` lists the modes of the current session.
+- A recipe's `[summary] prompt` sets what `oncall-mc summary` writes, for example a team's on-call log
+  format. Without it, a default summary is used: headline, one entry per incident, open items, watcher stats.
+
+If the user asks for a recipe and none exists, offer to write one. Copy `<root>/recipes/example.toml` to
+`~/.config/oncall-mc/recipes/<name>.toml` and fill it in with the user. Write each mode as a prompt in plain
+sentences. Run `recipe check` before you use it. Personal recipes hold channel IDs and paths, so never put
+them in a shared repo.
+
+## Commands the operator, watchers and workers use
+
+You rarely need these yourself:
+- `watcher new|show|stat|set|stop|restart|remove|ls` (`restart` brings a stopped watcher back with its saved
+  position; `--from-now` skips the backlog) (`new` takes `--mode <name>` or `--mode-prompt '...'`)
+- `task new|update|send|dispatch|reassign|show|ls` (`send` gives a worker more work and sets the task triaging) (`new` takes `--mode`; by default a task uses its watcher's mode)
+- `escalate <id> --need review|decision '<msg>'`: the user's input is needed. It sets the task to needs-you, puts
+  it in the panel's red strip, and messages the operator.
+- `notify <id> '<msg>'`: an FYI. It messages the operator, keeps the task's status, and shows in the panel's FYI
+  strip until the user acks it (`ack <id> --fyi`, or the strip's "Got it" button).
+- `ack <id>`: clears a flag.
+- `tick` is internal.
+
+Run `oncall-mc <command> --help` for the arguments of any command.
+
+## Files
+
+`<root>` is the folder that holds `bin/oncall-mc`.
+- `<root>/prompts/`: the role briefs. Edit these to change behavior.
+- `<root>/mods/mission-control/`: the panel. `install` copies it into Herdr.
+- `<root>/state/`:
+  - `config.json`
+  - `board.json`, which the panel reads
+  - the current session's `watchers/`, `tasks/` and reports
+  - `archive/`, the past sessions
+
+## Troubleshooting
+
+- To run a second Mission Control side by side, or a test, set these environment variables:
+  - `MC_ROOT=<folder>` for the state.
+  - `ONCALL_MC_SPACE=<name>` for its own Herdr space.
+  - `ONCALL_MC_RECIPES=<folder>` for its own recipes.
+
+- The panel is missing or stale: run `oncall-mc resume --panel`. Check that `oncall-mc install` reported
+  the panel as installed.
+- A watcher shows "no heartbeat": run `oncall-mc resume`. It restarts a dead watcher or ticker.
+  The ticker has a watchdog: if a watcher stays "working" with an unchanging screen for longer than
+  max(3 × interval, 20 min), it runs `hc interrupt`, sends a fresh tick, and records it on the watcher.
+  Tickers started before v0.7.0 lack the watchdog: restart them by running `oncall-mc resume` after killing
+  them, or start a new session.
+- An agent is `blocked` on a prompt: show the user `hc read <address>`. Do not approve prompts for them.
+- "Herdr app not reachable": the agents still run. Open Herdr, then run `oncall-mc resume`.
+"""
+
+
+def cmd_update(a):
+    """Pulls the latest release (a git checkout) and reinstalls the panel. Running agents keep running."""
+    if not (ROOT / ".git").exists():
+        die(f"{ROOT} is not a git checkout; replace it with a fresh copy, then run `oncall-mc install`")
+    r = subprocess.run(["git", "-C", str(ROOT), "pull", "--ff-only"], capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"git pull failed: {r.stderr.strip() or r.stdout.strip()}")
+    print(r.stdout.strip())
+    subprocess.run([sys.executable, MC, "install", *(["--no-link"] if a.no_link else [])])
+
+
+def cmd_guide(_a):
+    print(GUIDE)
+
+
+# ---------- recipes ----------
+#
+# A recipe bootstraps a session: named worker modes (free-text prompts), standing operator instructions,
+# and the watchers to start. TOML (Python 3.11+) or JSON. Looked up by path, then in USER_RECIPES, then in
+# <root>/recipes. See recipes/example.toml.
+
+def recipe_dirs():
+    return [USER_RECIPES, ROOT / "recipes"]
+
+
+def find_recipe(ref):
+    p = Path(ref).expanduser()
+    if p.suffix in (".toml", ".json") and p.exists():
+        return p
+    for d in recipe_dirs():
+        for ext in (".toml", ".json"):
+            if (d / f"{ref}{ext}").exists():
+                return d / f"{ref}{ext}"
+    die(f"no recipe {ref!r}. Looked in: {', '.join(str(d) for d in recipe_dirs())}. `oncall-mc recipe ls` lists them.")
+
+
+def parse_recipe(path):
+    text = path.read_text()
+    if path.suffix == ".json":
+        return json.loads(text)
+    try:
+        import tomllib
+    except ImportError:
+        die(f"{path.name} is TOML, which needs Python 3.11+ ({sys.version.split()[0]} here). Use a .json recipe instead.")
+    return tomllib.loads(text)
+
+
+def load_recipe(ref):
+    """Parses and checks a recipe. Returns (resolved recipe, problems)."""
+    path = find_recipe(ref)
+    r = parse_recipe(path)
+    problems = []
+    modes = {k: (v.get("prompt") if isinstance(v, dict) else v) for k, v in (r.get("modes") or {}).items()}
+    mode_agents = {k: spec(v.get("model"), v.get("effort")) for k, v in (r.get("modes") or {}).items() if isinstance(v, dict)}
+    mode_agents = {k: v for k, v in mode_agents.items() if v}
+    agents = {}
+    for role, v in (r.get("agents") or {}).items():
+        if role not in ("operator", "watcher", "worker") or not isinstance(v, dict):
+            problems.append(f"[agents.{role}]: roles are operator, watcher and worker, each with model and/or effort")
+            continue
+        agents[role] = spec(v.get("model"), v.get("effort"))
+    for role, sp in list(agents.items()) + [(f"mode {k} workers", v) for k, v in mode_agents.items()]:
+        cmd = config()["operator_cmd" if role == "operator" else "watcher_cmd" if role == "watcher" else "worker_cmd"]
+        if sp and not agent_kind(cmd):
+            problems.append(f"{role}: a model/effort is set but oncall-mc can't set flags for {cmd[0]!r} (add agent_flags to config.json)")
+    for k, v in modes.items():
+        if not isinstance(v, str) or not v.strip():
+            problems.append(f"mode {k!r} needs a prompt")
+    d = r.get("defaults") or {}
+    watchers, seen = [], set()
+    for i, w in enumerate(r.get("watchers") or []):
+        where = f"watcher {i + 1} ({w.get('channel', '?')})"
+        if not w.get("channel"):
+            problems.append(f"{where}: needs a channel")
+        if not (w.get("interest") or w.get("goal")):
+            problems.append(f"{where}: needs `interest` (what counts as interesting)")
+        mode = w.get("mode", d.get("mode"))
+        if mode and mode not in modes:
+            problems.append(f"{where}: mode {mode!r} is not defined (modes: {', '.join(modes) or 'none'})")
+        interval = int(w.get("interval", d.get("interval", 120)))
+        if interval < 30:
+            problems.append(f"{where}: interval must be at least 30 seconds")
+        key = w.get("channel_id") or w.get("channel")
+        if key in seen:
+            problems.append(f"{where}: channel listed twice")
+        seen.add(key)
+        watchers.append({
+            "channel": w.get("channel", ""), "channel_id": w.get("channel_id"), "name": w.get("name"),
+            "interval": interval, "lookback": w.get("lookback", d.get("lookback", "1h")),
+            "mode": mode, "goal": compose_goal(w), "enabled": w.get("enabled", True),
+            "agent": spec(w.get("model"), w.get("effort")), "worker_agent": spec(w.get("worker_model"), w.get("worker_effort")),
+        })
+    resolved = {
+        "name": r.get("name") or path.stem, "description": r.get("description", ""), "path": str(path),
+        "workdir": r.get("workdir"), "max_active_workers": r.get("max_active_workers"),
+        "operator": (r.get("operator") or {}).get("instructions", ""), "modes": modes, "watchers": watchers,
+        "agents": agents, "mode_agents": mode_agents,
+        "summary": ((r.get("summary") or {}).get("prompt") or "").strip(),
+    }
+    return resolved, problems
+
+
+def compose_goal(w):
+    if w.get("goal"):
+        return w["goal"].strip()
+    parts = [f"Interesting: {(w.get('interest') or '').strip()}"]
+    if w.get("escalate"):
+        parts.append(f"Escalate to the user when: {w['escalate'].strip()}")
+    if w.get("notes"):
+        parts.append(w["notes"].strip())
+    return "\n\n".join(parts)
+
+
+def session_modes():
+    return (read(STATE / "recipe.json") or {}).get("modes", {})
+
+
+def resolve_mode(name, prompt=None):
+    """(mode name, mode prompt) from --mode / --mode-prompt, using the session's recipe modes."""
+    if prompt:
+        return name or "custom", prompt
+    if not name:
+        return None, None
+    modes = session_modes()
+    if name not in modes:
+        die(f"no mode {name!r} in this session (modes: {', '.join(modes) or 'none; start with --recipe or pass --mode-prompt'})")
+    return name, modes[name]
+
+
+def recipe_operator_section(rec):
+    if not rec:
+        return ""
+    lines = [f"\n## This session's recipe: {rec['name']}\n"]
+    if rec.get("description"):
+        lines.append(rec["description"].strip() + "\n")
+    if rec.get("operator"):
+        lines.append("### Standing instructions\n\n" + rec["operator"].strip() + "\n")
+    if rec.get("modes"):
+        lines.append("### Worker modes\n\nPick one with `--mode <name>` on `watcher new` or `task new`. "
+                     "oncall-mc adds the mode's prompt to every worker brief.\n")
+        for k, v in rec["modes"].items():
+            lines.append(f"- `{k}`: {v.strip().splitlines()[0][:160]}")
+    return "\n".join(lines) + "\n"
+
+
+def apply_recipe(rec):
+    """Adds the recipe's modes and watchers to the current session. Skips channels already watched."""
+    current = read(STATE / "recipe.json") or {"name": rec["name"], "modes": {}, "operator": ""}
+    current["modes"] = {**current.get("modes", {}), **rec["modes"]}
+    current["mode_agents"] = {**(current.get("mode_agents") or {}), **rec.get("mode_agents", {})}
+    current["agents"] = {**(current.get("agents") or {}), **rec.get("agents", {})}
+    current["name"] = rec["name"] if current.get("name") in (None, rec["name"]) else f"{current['name']}+{rec['name']}"
+    if rec["operator"] and rec["operator"] not in (current.get("operator") or ""):
+        current["operator"] = "\n\n".join(x for x in (current.get("operator"), rec["operator"]) if x)
+    current["description"] = rec.get("description") or current.get("description", "")
+    if rec.get("summary"):
+        current["summary"] = rec["summary"]
+    write(STATE / "recipe.json", current)
+    if rec.get("max_active_workers"):
+        c = read(STATE / "config.json") or {}
+        c["max_active_workers"] = int(rec["max_active_workers"])
+        write(STATE / "config.json", {**DEFAULT_CONFIG, **c})
+    watched = {x for w in all_json("watchers") if w["status"] != "stopped" for x in (w.get("channel_id"), w["channel"]) if x}
+    started, skipped = [], []
+    for w in rec["watchers"]:
+        if not w["enabled"]:
+            skipped.append(f"{w['channel']} (disabled)")
+        elif (w["channel_id"] and w["channel_id"] in watched) or w["channel"] in watched:
+            skipped.append(f"{w['channel']} (already watched)")
+        else:
+            mode, prompt = (w["mode"], rec["modes"][w["mode"]]) if w["mode"] else (None, None)
+            started.append(create_watcher(w["channel"], w["channel_id"], w["goal"], w["interval"], w["lookback"],
+                                          w["name"], mode, prompt, agent=w["agent"], worker_agent=w["worker_agent"])["id"])
+    return started, skipped
+
+
+def cmd_recipe_ls(_a):
+    for d in recipe_dirs():
+        files = sorted(list(d.glob("*.toml")) + list(d.glob("*.json"))) if d.exists() else []
+        print(f"{d}{'' if files else '  (none)'}")
+        for f in files:
+            try:
+                r = parse_recipe(f)
+                print(f"  {f.stem:28} {len(r.get('watchers') or [])} watchers  {(r.get('description') or '').strip()[:70]}")
+            except Exception as e:  # show broken recipes instead of hiding them
+                print(f"  {f.stem:28} UNREADABLE: {e}")
+
+
+def fmt_spec(sp):
+    return " ".join(x for x in ((sp or {}).get("model"), (sp or {}).get("effort")) if x) or "-"
+
+
+def cmd_recipe_show(a):
+    rec, problems = load_recipe(a.name)
+    print(f"{rec['name']}  ({rec['path']})\n{rec['description'].strip()}\n")
+    print("agents:")
+    for role in ("operator", "watcher", "worker"):
+        print(f"  {role:9} {fmt_spec(rec['agents'].get(role))}")
+    print("modes:")
+    for k, v in rec["modes"].items():
+        extra = f"  [workers: {fmt_spec(rec['mode_agents'][k])}]" if k in rec["mode_agents"] else ""
+        print(f"  {k}: {v.strip().splitlines()[0][:100]}{extra}")
+    print("watchers:")
+    for w in rec["watchers"]:
+        flag = "" if w["enabled"] else "  [disabled]"
+        over = "".join(f"  {k}={fmt_spec(w[k])}" for k in ("agent", "worker_agent") if w[k])
+        print(f"  {w['channel']:40} every {w['interval']}s  mode={w['mode'] or '-'}  lookback={w['lookback']}{over}{flag}")
+    print("summary: " + ("recipe prompt: " + rec["summary"].splitlines()[0][:100] if rec["summary"] else "default prompt"))
+    print("problems: " + ("none" if not problems else "\n  " + "\n  ".join(problems)))
+
+
+def cmd_recipe_check(a):
+    rec, problems = load_recipe(a.name)
+    if problems:
+        die(f"{rec['path']}: " + "; ".join(problems))
+    print(json.dumps({"ok": True, "recipe": rec["name"], "watchers": len(rec["watchers"]), "modes": list(rec["modes"])}))
+
+
+def cmd_recipe_add(a):
+    """Saves a recipe from a file or stdin (pasted text), after checking it."""
+    text = Path(a.file).expanduser().read_text() if a.file else sys.stdin.read()
+    if not text.strip():
+        die("no recipe text: pipe it in or pass --file")
+    try:
+        json.loads(text)
+        ext = ".json"
+    except json.JSONDecodeError:
+        ext = ".toml"
+    name = slug(a.name, 48)
+    dest = USER_RECIPES / f"{name}{ext}"
+    others = [p for p in (USER_RECIPES / f"{name}.toml", USER_RECIPES / f"{name}.json") if p.exists()]
+    if others and not a.force:
+        die(f"{others[0]} exists. Use another name, or --force to replace it.")
+    USER_RECIPES.mkdir(parents=True, exist_ok=True)
+    tmp = USER_RECIPES / f".{name}.check{ext}"
+    tmp.write_text(text)
+    try:
+        rec, problems = load_recipe(str(tmp))
+    finally:
+        tmp.unlink(missing_ok=True)
+    if problems:
+        die("recipe not saved: " + "; ".join(problems))
+    for p in others:
+        p.unlink()
+    dest.write_text(text)
+    print(json.dumps({"saved": str(dest), "recipe": name, "watchers": len(rec["watchers"]), "modes": list(rec["modes"]),
+                      "next": f"oncall-mc start --recipe {name}"}))
+
+
+def cmd_recipe_apply(a):
+    rec, problems = load_recipe(a.name)
+    if problems:
+        die(f"{rec['path']}: " + "; ".join(problems))
+    if not session():
+        die("no session. Run `oncall-mc start --recipe <name>`.")
+    with locked():
+        started, skipped = apply_recipe(rec)
+        (STATE / "operator.md").write_text(render("OPERATOR.md", mc=MC) + recipe_operator_section(read(STATE / "recipe.json")))
+    notify_operator(f"[oncall-mc] Recipe {rec['name']} applied. Started: {', '.join(started) or 'none'}. "
+                    f"Skipped: {', '.join(skipped) or 'none'}. Modes: {', '.join(rec['modes'])}. "
+                    f"Re-read {STATE / 'operator.md'} for its standing instructions.")
+    print(json.dumps({"recipe": rec["name"], "started": started, "skipped": skipped, "modes": list(rec["modes"])}))
+
+
+def cmd_modes(_a):
+    modes = session_modes()
+    if not modes:
+        print("no modes in this session. Start with --recipe, or pass --mode-prompt on watcher/task new.")
+    for k, v in modes.items():
+        print(f"## {k}\n{v.strip()}\n")
+
+
+# ---------- watchers ----------
+
+def cmd_watcher_new(a):
+    mode, prompt = resolve_mode(a.mode, a.mode_prompt)
+    with locked():
+        w = create_watcher(a.channel, a.channel_id, a.goal, a.interval, a.lookback, a.name, mode, prompt,
+                           agent=spec(a.model, a.effort), worker_agent=spec(a.worker_model, a.worker_effort))
+    print(json.dumps({"watcher": w["id"], "address": w["address"], "ticker": w["ticker"], "mode": mode, "agent": w["agent"],
+                      "brief": str(STATE / "watchers" / f"{w['id']}.md")}))
+
+
+def create_watcher(channel, channel_id, goal, interval, lookback, name=None, mode=None, mode_prompt=None,
+                   agent=None, worker_agent=None):
+    """Writes the watcher's brief and record, then starts it and its ticker. Call inside locked()."""
+    channel = channel if channel.startswith("#") else f"#{channel}"
+    base = "w-" + slug(name or channel, 24)
+    wid, n = base, 2
+    while read(watcher_path(wid)) and read(watcher_path(wid)).get("status") != "stopped":
+        wid, n = f"{base[:22]}-{n}", n + 1
+    brief = STATE / "watchers" / f"{wid}.md"
+    (STATE / "watchers" / wid).mkdir(parents=True, exist_ok=True)  # the watcher's scratch folder
+    brief.write_text(render(
+        "WATCHER.md", id=wid, channel=channel, channel_id=channel_id or "(look it up)",
+        goal=goal, interval=interval, lookback=lookback, mc=MC, workdir=config()["workdir"],
+        max_workers=config()["max_active_workers"], state=STATE, scratch=STATE / "watchers" / wid,
+        mode=mode or "none", mode_prompt=(mode_prompt or "No mode is set. The mandate above says what workers may do.").strip(),
+    ))
+    w = {
+        "id": wid, "name": wid, "channel": channel, "channel_id": channel_id, "goal": goal,
+        "mode": mode, "mode_prompt": mode_prompt,
+        "agent": merge_specs(agent, recipe_agent("watcher")), "worker_agent": worker_agent,
+        "interval": interval, "status": "starting", "created_at": now(), "address": None,
+        "ticker": None, "stats": {"checks": 0, "seen": 0, "matched": 0, "last_check": None,
+                                  "cursor": None, "last_error": None, "note": None},
+    }
+    write(watcher_path(wid), w)
+    launch_watcher(w, resumed=False)
+    w["status"] = "running"
+    write(watcher_path(wid), w)
+    return w
+
+
+def cmd_watcher_stat(a):
+    with locked():
+        w = get_watcher(a.id)
+        s = w["stats"]
+        s["checks"] += 1
+        s["last_check"] = now()
+        s["seen"] += a.seen
+        s["matched"] += a.matched
+        if a.cursor:
+            s["cursor"] = a.cursor
+        s["last_error"] = a.error
+        if a.note is not None:
+            s["note"] = a.note
+        write(watcher_path(a.id), w)
+    print(json.dumps({"ok": True, "stats": s}))
+
+
+def cmd_watcher_show(a):
+    w = get_watcher(a.id)
+    w["tasks"] = [t for t in all_json("tasks") if t["watcher"] == a.id]
+    print(json.dumps(w, indent=2))
+
+
+def cmd_watcher_ls(_a):
+    ensure_dirs()
+    for w in all_json("watchers"):
+        s = w["stats"]
+        print(f"{w['id']:28} {w['status']:8} {w['channel']:30} {w.get('address') or '-':6} "
+              f"checks={s['checks']} seen={s['seen']} matched={s['matched']}")
+
+
+def cmd_watcher_stop(a):
+    with locked():
+        w = get_watcher(a.id)
+        for t in (w.get("ticker"), w.get("address")):
+            if t:
+                subprocess.run(["hc", "kill", t], capture_output=True)
+        w["status"] = "stopped"
+        w["stopped_at"] = now()
+        write(watcher_path(a.id), w)
+    print(json.dumps({"stopped": a.id}))
+
+
+def cmd_watcher_set(a):
+    with locked():
+        w = get_watcher(a.id)
+        if a.interval is not None:
+            if a.interval < 30:
+                die("interval must be at least 30 seconds")
+            w["interval"] = a.interval
+        write(watcher_path(a.id), w)
+    if a.interval is not None and program_alive(w.get("address")):
+        subprocess.run(["hc", "send", w["address"], f"[oncall-mc] Your watch interval is now {a.interval}s."],
+                       capture_output=True)
+    print(json.dumps({"watcher": a.id, "interval": w["interval"]}))
+
+
+def cmd_watcher_restart(a):
+    """Brings a stopped (or dead) watcher back under the same id, with its stats and Slack cursor."""
+    with locked():
+        w = get_watcher(a.id)
+        if w["status"] != "stopped" and program_alive(w.get("address")):
+            die(f"{a.id} is already running ({w['address']}). A hung turn is handled by the ticker's watchdog; "
+                "a dead agent by `oncall-mc resume`.")
+        keys = {x for x in (w.get("channel_id"), w["channel"]) if x}
+        dup = next((o for o in all_json("watchers") if o["id"] != w["id"] and o["status"] != "stopped"
+                    and keys & {x for x in (o.get("channel_id"), o["channel"]) if x}), None)
+        if dup and not a.force:
+            die(f"{dup['id']} already watches {w['channel']}. Stop it first, or pass --force to run both.")
+        retire(w.get("ticker"))
+        retire(w.get("address"))
+        stopped_for = now() - w["stopped_at"] if w.get("stopped_at") else None
+        if a.from_now:
+            w["stats"]["cursor"] = f"{now()}.000000"
+        w["status"] = "running"
+        w.pop("stopped_at", None)
+        w["stats"]["note"] = (f"restarted {time.strftime('%m/%d %H:%M')}"
+                              + (f" after {fmt_duration(stopped_for)} stopped" if stopped_for else "")
+                              + ("; skipping the backlog" if a.from_now else "; catching up from its saved position"))
+        launch_watcher(w, resumed=True)
+        write(watcher_path(w["id"]), w)
+    print(json.dumps({"restarted": w["id"], "address": w["address"], "ticker": w["ticker"],
+                      "cursor": w["stats"]["cursor"], "from_now": a.from_now}))
+
+
+def cmd_watcher_remove(a):
+    with locked():
+        w = get_watcher(a.id)
+        if w["status"] != "stopped":
+            die("stop it first")
+        watcher_path(a.id).unlink()
+    print(json.dumps({"removed": a.id}))
+
+
+# Timers, spinners and token counters change every second even when an agent is stuck, so they are ignored.
+_VOLATILE = re.compile(r"[0-9\u2800-\u28ff\u2722-\u273f\u00b7\u2022*]")
+
+
+def screen_sig(addr):
+    """A fingerprint of the agent's visible screen, minus the parts that change while it is stuck."""
+    r = subprocess.run(["hc", "read", addr, "--lines", "0"], capture_output=True, text=True)
+    lines = [ln for ln in r.stdout.splitlines() if "esc to interrupt" not in ln and ln.strip()]
+    return hashlib.sha256(_VOLATILE.sub("", "\n".join(lines)).encode()).hexdigest()[:16]
+
+
+class Watchdog:
+    """Notices a watcher turn that stays 'working' with an unchanging screen for too long."""
+
+    def __init__(self):
+        self.sig, self.since = None, None
+
+    def observe(self, state, sig, now_s, limit_s):
+        """Returns the stuck duration in seconds when it is time to intervene, else None."""
+        if state != "working":
+            self.sig, self.since = None, None
+            return None
+        if sig != self.sig:
+            self.sig, self.since = sig, now_s
+            return None
+        if now_s - self.since >= limit_s:
+            stuck = now_s - self.since
+            self.sig, self.since = None, None
+            return stuck
+        return None
+
+
+def fmt_duration(sec):
+    sec = int(sec)
+    return f"{sec // 3600}h{(sec % 3600) // 60:02d}m" if sec >= 3600 else f"{sec // 60}m"
+
+
+def cmd_tick(a):
+    """Runs in its own hc terminal: wakes the watcher when it is idle, and unsticks it when a turn hangs."""
+    dog = Watchdog()
+    while True:
+        w = read(watcher_path(a.id))
+        if not w or w.get("status") == "stopped":
+            print("watcher stopped; ticker exiting")
+            return
+        # Wait the interval, re-reading it so `watcher set --interval` applies within seconds.
+        started = time.time()
+        while w and w.get("status") != "stopped" and time.time() - started < max(30, int(w.get("interval", 120))):
+            time.sleep(5)
+            w = read(watcher_path(a.id))
+        if not w or w.get("status") == "stopped":
+            return
+        addr = w["address"]
+        st = agent_state(addr)
+        stamp = time.strftime("%H:%M:%S")
+        if st is None:
+            print(f"{stamp} watcher {addr} not live; ticker exiting")
+            return
+        limit = max(3 * int(w.get("interval", 120)), 1200)
+        stuck = dog.observe(st, screen_sig(addr) if st == "working" else None, time.time(), limit)
+        if stuck is not None:
+            r = subprocess.run(["hc", "interrupt", addr], capture_output=True, text=True)
+            time.sleep(5)
+            note = f"watchdog: turn hung for {fmt_duration(stuck)} with no screen change; interrupted at {time.strftime('%m/%d %H:%M')}"
+            subprocess.run(["hc", "send", addr, f"[oncall-mc tick {stamp}] Your last turn hung for {fmt_duration(stuck)} with no progress "
+                                                f"and was interrupted by the watchdog. Run one fresh watch cycle per your brief."],
+                           capture_output=True)
+            with locked():
+                x = read(watcher_path(a.id))
+                if x:
+                    x["stats"]["note"] = note
+                    x.setdefault("watchdog", []).append({"at": now(), "stuck_s": int(stuck), "interrupt": (r.stdout or r.stderr).strip()[:200]})
+                    write(watcher_path(a.id), x)
+            print(f"{stamp} {note}; tick sent")
+        elif st in ("idle", "done"):
+            subprocess.run(["hc", "send", addr,
+                            f"[oncall-mc tick {stamp}] Run one watch cycle per your brief. End quietly if nothing changed."],
+                           capture_output=True)
+            print(f"{stamp} tick sent")
+        else:
+            print(f"{stamp} skipped: watcher is {st}")
+
+
+# ---------- tasks ----------
+
+def next_task_id():
+    counter = STATE / "counter"
+    n = int(counter.read_text()) + 1 if counter.exists() else 1
+    counter.write_text(str(n))
+    return f"task-{n:03d}"
+
+
+def owner_address(owner):
+    """The terminal a task's owner (a watcher id, or "operator") answers on."""
+    if owner == "operator":
+        return operator_address()
+    return (read(watcher_path(owner)) or {}).get("address")
+
+
+def write_worker_brief(t, report_to):
+    (STATE / "tasks" / t["id"]).mkdir(parents=True, exist_ok=True)  # the worker's artifacts folder
+    brief_file = STATE / "tasks" / f"{t['id']}.md"
+    brief_file.write_text(render(
+        "WORKER.md", id=t["id"], title=t["title"], source=t.get("source") or "(none)",
+        watcher=t["watcher"], brief=t["brief"], mc=MC, report_to=report_to, workdir=config()["workdir"],
+        report=STATE / "tasks" / f"{t['id']}.report.md", artifacts=STATE / "tasks" / t["id"],
+        mode=t.get("mode") or "none",
+        mode_prompt=(t.get("mode_prompt") or "No mode is set. Follow the brief; when it is silent, stay read-only and post nothing.").strip(),
+    ))
+    return brief_file
+
+
+def dispatch(t):
+    parent = caller() if t["watcher"] != "operator" else (operator_address() or caller())
+    report_to = parent or operator_address()
+    brief_file = write_worker_brief(t, report_to)
+    first = f"You are Mission Control worker {t['id']}. Read {brief_file} and follow it."
+    addr = launch(t["id"], with_agent(config()["worker_cmd"], t.get("agent")), first,
+                  {"mc.role": "worker", "mc.task": t["id"], "mc.watcher": t["watcher"]}, parent=parent)
+    t["worker"] = {"name": t["id"], "address": addr}
+    t["status"] = "triaging"
+    t["history"].append({"at": now(), "status": "triaging", "note": f"worker {addr} started"})
+
+
+def cmd_task_new(a):
+    brief = Path(a.brief_file).read_text() if a.brief_file else a.brief
+    if not brief:
+        die("give --brief or --brief-file")
+    with locked():
+        mode, mode_prompt = resolve_mode(a.mode, a.mode_prompt)
+        w = None
+        if a.watcher != "operator":
+            w = get_watcher(a.watcher)
+            if not mode:  # a watcher's workers inherit its mode
+                mode, mode_prompt = w.get("mode"), w.get("mode_prompt")
+        agent = worker_spec(spec(a.model, a.effort), w, mode)
+        if a.source:
+            dup = next((t for t in all_json("tasks") if t.get("source") == a.source), None)
+            if dup:
+                die(f"{dup['id']} already covers {a.source}; use `oncall-mc task update {dup['id']} --note ...`")
+        t = {
+            "id": next_task_id(), "watcher": a.watcher, "title": a.title, "source": a.source, "brief": brief,
+            "mode": mode, "mode_prompt": mode_prompt, "agent": agent,
+            "status": "queued", "summary": None, "prs": [], "links": [], "worker": None, "attention": None,
+            "created_at": now(), "updated_at": now(), "history": [{"at": now(), "status": "queued", "note": None}],
+        }
+        active_workers = [x for x in all_json("tasks") if x["status"] in ACTIVE and x.get("worker")]
+        if not a.no_dispatch and len(active_workers) < config()["max_active_workers"]:
+            dispatch(t)
+        write(task_path(t["id"]), t)
+    print(json.dumps({"task": t["id"], "status": t["status"], "worker": t["worker"]}))
+
+
+def cmd_task_dispatch(a):
+    with locked():
+        t = get_task(a.id)
+        if t.get("worker") and is_live(t["worker"]["address"]):
+            die(f"{a.id} already has live worker {t['worker']['address']}")
+        dispatch(t)
+        t["updated_at"] = now()
+        write(task_path(a.id), t)
+    print(json.dumps({"task": a.id, "worker": t["worker"]}))
+
+
+def cmd_task_reassign(a):
+    to = a.to
+    with locked():
+        t = get_task(a.id)
+        old = t["watcher"]
+        if to == old:
+            die(f"{a.id} already belongs to {to}")
+        if to != "operator":
+            w = get_watcher(to)
+            if w["status"] == "stopped":
+                die(f"{to} is stopped; pick a running watcher or 'operator'")
+        new_addr = owner_address(to)
+        t["watcher"] = to
+        t["updated_at"] = now()
+        t["history"].append({"at": now(), "status": t["status"], "note": f"reassigned from {old} to {to}" + (f": {a.note}" if a.note else "")})
+        if t.get("worker"):
+            write_worker_brief(t, new_addr or operator_address())
+        write(task_path(a.id), t)
+    sent = {}
+    worker = (t.get("worker") or {}).get("address")
+    why = f" Reason: {a.note}" if a.note else ""
+    msgs = [
+        (worker, f"[oncall-mc] {a.id} now belongs to {to}. From now on, report to {new_addr} "
+                 f"(hc send {new_addr} ...), not to {old}. Your brief file is updated.{why}"),
+        (new_addr, f"[oncall-mc] {a.id} ({t['title']}) was reassigned to you from {old}.{why} "
+                   f"Track it as one of your tasks: `{MC} task show {a.id}`. Its worker is {worker or 'not started'}."),
+        (owner_address(old), f"[oncall-mc] {a.id} ({t['title']}) moved from you to {to}. Stop tracking it."),
+    ]
+    for addr, text in msgs:
+        if addr and program_alive(addr):
+            subprocess.run(["hc", "send", addr, text], capture_output=True)
+            sent[addr] = True
+    print(json.dumps({"task": a.id, "from": old, "to": to, "notified": list(sent)}))
+
+
+def cmd_task_send(a):
+    """Gives a task's worker more work and marks the task triaging again, so the panel stays true."""
+    with locked():
+        t = get_task(a.id)
+        addr = (t.get("worker") or {}).get("address")
+        if not program_alive(addr):
+            die(f"{a.id} has no running worker. Start one with `oncall-mc task dispatch {a.id}` (or `oncall-mc resume`).")
+        if agent_state(addr) == "blocked":
+            die(f"{a.id}'s worker is waiting at a prompt. Show the user `hc read {addr}`; do not send into it.")
+        if t["status"] != "needs-you":
+            t["status"] = "triaging"
+            t["attention"] = None
+        t["updated_at"] = now()
+        t["history"].append({"at": now(), "status": t["status"], "note": f"more work sent: {a.message[:200]}"})
+        write(task_path(a.id), t)
+    subprocess.run(["hc", "send", addr, f"[oncall-mc] More work on {a.id}. Your task is set back to triaging; "
+                                        f"update it as you go and report when done.\n\n{a.message}"], capture_output=True)
+    print(json.dumps({"task": a.id, "status": t["status"], "sent_to": addr}))
+
+
+def cmd_task_update(a):
+    with locked():
+        t = get_task(a.id)
+        if a.status:
+            t["status"] = a.status
+        if a.summary is not None:
+            t["summary"] = a.summary
+        if a.title:
+            t["title"] = a.title
+        for pr in a.pr or []:
+            if pr not in t["prs"]:
+                t["prs"].append(pr)
+        for link in a.link or []:
+            if link not in t["links"]:
+                t["links"].append(link)
+        if a.status and a.status != "needs-you":
+            t["attention"] = None  # the task moved on; "needs you" is its status, not a sticky flag
+        t["updated_at"] = now()
+        t["history"].append({"at": now(), "status": t["status"], "note": a.note})
+        write(task_path(a.id), t)
+    print(json.dumps({"task": a.id, "status": t["status"]}))
+
+
+def cmd_task_ls(a):
+    ensure_dirs()
+    for t in all_json("tasks"):
+        if a.watcher and t["watcher"] != a.watcher:
+            continue
+        if not a.all and t["status"] not in ACTIVE:
+            continue
+        w = (t.get("worker") or {}).get("address") or "-"
+        print(f"{t['id']:9} {t['status']:10} {t['watcher']:26} {w:6} {t['title']}  {t.get('source') or ''}")
+
+
+def cmd_task_show(a):
+    print(json.dumps(get_task(a.id), indent=2))
+
+
+def cmd_escalate(a):
+    with locked():
+        target = None
+        if read(task_path(a.id)):
+            t = get_task(a.id)
+            earlier = t.pop("fyis", None) or ([t.pop("fyi")] if t.get("fyi") else [])
+            t["attention"] = {"message": a.message, "at": now(), "need": a.need, "updates": earlier}
+            t["status"] = "needs-you"
+            t["updated_at"] = now()
+            t["history"].append({"at": now(), "status": "needs-you", "note": f"escalated ({a.need}): {a.message}"})
+            write(task_path(a.id), t)
+            target = f"{a.id} ({t['title']})"
+        else:
+            w = get_watcher(a.id)
+            w["attention"] = {"message": a.message, "at": now()}
+            write(watcher_path(a.id), w)
+            target = a.id
+    label = {"review": "ready for the user's review", "decision": "needs a decision from the user"}.get(a.need, a.need)
+    folded = len(((read(task_path(a.id)) or {}).get("attention") or {}).get("updates") or [])
+    sent = notify_operator(f"[oncall-mc attention] {target} {label}: {a.message}"
+                           + (f" (This absorbs {folded} earlier FYI(s) on the task: present it as one item.)" if folded else ""))
+    print(json.dumps({"escalated": a.id, "need": a.need, "operator_notified": sent}))
+
+
+def cmd_notify(a):
+    """An FYI for the user: no status change, no "needs you"."""
+    with locked():
+        t = get_task(a.id)
+        if t["status"] == "needs-you" and t.get("attention"):
+            # One item per task: news on a task that already needs the user joins that request.
+            t["attention"].setdefault("updates", []).append({"message": a.message, "at": now()})
+            t["updated_at"] = now()
+            t["history"].append({"at": now(), "status": t["status"], "note": f"update folded into the pending request: {a.message}"})
+            write(task_path(a.id), t)
+            sent = notify_operator(f"[oncall-mc update] {a.id} ({t['title']}) already needs the user's {t['attention'].get('need', 'input')}. "
+                                   f"New context: {a.message} Fold this into that pending request; do not send it as a separate FYI.")
+            print(json.dumps({"notified": a.id, "folded_into": "needs-you", "operator_notified": sent}))
+            return
+        fyis = t.get("fyis") or ([t["fyi"]] if t.get("fyi") else [])  # every FYI stays until the user acks
+        fyis.append({"message": a.message, "at": now()})
+        t["fyis"] = fyis
+        t.pop("fyi", None)
+        t["updated_at"] = now()
+        t["history"].append({"at": now(), "status": t["status"], "note": f"fyi: {a.message}"})
+        write(task_path(a.id), t)
+    sent = notify_operator(f"[oncall-mc fyi] {a.id} ({t['title']}, still {t['status']}): {a.message}")
+    print(json.dumps({"notified": a.id, "status": t["status"], "operator_notified": sent}))
+
+
+BRIEF_PROMPT = """[oncall-mc brief request] The user clicked "Brief me" on {what}. They have lost context and want to catch up.
+Before you answer, read: `{mc} {show}`{report}, and the source Slack thread{source}. Check the worker's terminal (`hc read {worker}`) only if those leave a gap.
+Then brief the user in this shape, at most about 12 lines, plain sentences:
+- What happened: the alert or question, in one or two lines.
+- Where it stands: what the worker found, with its confidence. Say which parts are verified and which are hypotheses.
+- What it needs from you: the exact decision or action, the options, and your recommendation with the reason.
+- Urgency: is anything ongoing or customer-facing, and is there a deadline?
+- Links: the source thread, the PR, the report file.
+Do not act on the decision until the user answers."""
+
+
+def cmd_brief(a):
+    """Asks the operator to catch the user up on a task (or a flagged watcher)."""
+    op = operator_address()
+    if not program_alive(op):
+        die("the operator is not running. Run `oncall-mc resume`.")
+    if agent_state(op) == "blocked":
+        die(f"the operator is waiting at a prompt. Answer it in its pane first (`hc read {op}`).")
+    t = read(task_path(a.id))
+    if t:
+        worker = (t.get("worker") or {}).get("address") or "(none)"
+        report = STATE / "tasks" / f"{t['id']}.report.md"
+        fyis = (t.get("fyis") or ([t["fyi"]] if t.get("fyi") else [])) + ((t.get("attention") or {}).get("updates") or [])
+        fyis.sort(key=lambda f: f["at"])
+        fyi_text = ""
+        if fyis:
+            fyi_text = (". Unacknowledged FYIs and updates on it, oldest first: "
+                        + " | ".join(f"{time.strftime('%m/%d %H:%M', time.localtime(f['at']))}: {f['message']}" for f in fyis)
+                        + ". Explain what each FYI means and why it was raised. If nothing is needed from the user, say so "
+                          "plainly in the 'What it needs from you' line")
+        text = BRIEF_PROMPT.format(
+            what=f"{t['id']} ({t['title']}), status {t['status']}" + (f", flagged: {t['attention']['message']}" if t.get("attention") else "") + fyi_text,
+            mc=MC, show=f"task show {t['id']}", worker=worker,
+            report=f", the report `{report}`, and the files in `{STATE / 'tasks' / t['id']}/`" if report.exists() else "",
+            source=f" ({t['source']})" if t.get("source") else "")
+        with locked():
+            t["history"].append({"at": now(), "status": t["status"], "note": "user asked the operator for a brief"})
+            write(task_path(a.id), t)
+    else:
+        w = get_watcher(a.id)
+        text = BRIEF_PROMPT.format(what=f"watcher {w['id']} on {w['channel']}" + (f", flagged: {w['attention']['message']}" if w.get("attention") else ""),
+                                   mc=MC, show=f"watcher show {w['id']}", worker=w.get("address"), report="", source="")
+    subprocess.run(["hc", "send", op, text], capture_output=True)
+    print(json.dumps({"briefing": a.id, "operator": op}))
+
+
+DEFAULT_SUMMARY = """Write an end-of-shift summary of everything Mission Control investigated.
+- Headline: how many alerts and incidents were looked at, how many are resolved, how many need follow-up.
+- One entry per incident or alert. Merge tasks that were the same issue. For each one: what happened, impact,
+  root cause and its confidence, what was done (PRs, Slack replies, decisions, and who decided), and its status
+  at the end of the shift, with links.
+- Open items: follow-ups, each with an owner and a link.
+- Watchers: each channel, with checks, messages seen and items matched.
+Use plain sentences. State facts only from the digest, the reports and the threads. Mark anything unverified."""
+
+SUMMARY_FRAME = """[oncall-mc summary request] The user asked for an end-of-shift summary of this session.
+Input: {digest}. It lists every task (status, summary, PRs, links, source, history and report path) and every watcher.
+Read the reports and source threads it points to where the summary needs more than the digest gives.
+
+What to write:
+{prompt}
+
+Write the full summary to {out}. Then reply to the user with a short version of at most 10 lines and the file path.
+Do not post, email or publish the summary anywhere unless the user asks you to after reading it."""
+
+
+def summary_digest(since):
+    s = session() or {}
+    lines = [f"# Mission Control digest: session {s.get('id')}" + (f" ({s['name']})" if s.get("name") else ""),
+             f"Session started {time.strftime('%Y-%m-%d %H:%M %Z', time.localtime(s.get('started_at', now())))}; "
+             f"digest written {time.strftime('%Y-%m-%d %H:%M %Z')}." + (f" Only tasks updated since {time.strftime('%Y-%m-%d %H:%M', time.localtime(since))}." if since else ""), ""]
+    watchers = {w["id"]: w for w in all_json("watchers")}
+    lines.append("## Watchers")
+    for w in watchers.values():
+        st = w["stats"]
+        lines.append(f"- {w['channel']} ({w['id']}, {w['status']}): {st['checks']} checks, {st['seen']} messages seen, "
+                     f"{st['matched']} matched, every {w['interval']}s, mode {w.get('mode') or '-'}. Goal: {w['goal'][:300]}")
+    lines += ["", "## Tasks"]
+    for t in all_json("tasks"):
+        if since and t.get("updated_at", 0) < since:
+            continue
+        owner = "operator (direct task)" if t["watcher"] == "operator" else (watchers.get(t["watcher"], {}).get("channel") or t["watcher"])
+        report = STATE / "tasks" / f"{t['id']}.report.md"
+        lines += [f"### {t['id']}: {t['title']}",
+                  f"- Owner: {owner}. Status: {t['status']}. Mode: {t.get('mode') or '-'}. "
+                  f"Opened {time.strftime('%m/%d %H:%M', time.localtime(t['created_at']))}, last update {time.strftime('%m/%d %H:%M', time.localtime(t['updated_at']))}.",
+                  f"- Summary: {t.get('summary') or '-'}"]
+        if t.get("attention"):
+            lines.append(f"- Flagged for the user: {t['attention']['message']}")
+        if t.get("source"):
+            lines.append(f"- Source: {t['source']}")
+        if t.get("prs"):
+            lines.append(f"- PRs: {', '.join(t['prs'])}")
+        if t.get("links"):
+            lines.append(f"- Links: {', '.join(t['links'])}")
+        lines.append(f"- Report: {report if report.exists() else '(none)'}; artifacts: {STATE / 'tasks' / t['id']}/")
+        notes = [h for h in t.get("history", []) if h.get("note")][-6:]
+        if notes:
+            lines.append("- Recent history: " + " | ".join(f"{time.strftime('%m/%d %H:%M', time.localtime(h['at']))} {h['status']}: {h['note'][:220]}" for h in notes))
+        lines.append("")
+    return "\n".join(lines)
+
+
+def cmd_summary(a):
+    """Asks the operator for an end-of-shift summary (the recipe's [summary] prompt, else the default)."""
+    op = operator_address()
+    if not program_alive(op):
+        die("the operator is not running. Run `oncall-mc resume`.")
+    if agent_state(op) == "blocked":
+        die(f"the operator is waiting at a prompt. Answer it in its pane first (`hc read {op}`).")
+    since = None
+    if a.since:
+        try:
+            since = int(time.mktime(time.strptime(a.since, "%Y-%m-%d"))) if "-" in a.since else now() - int(float(a.since) * 3600)
+        except ValueError:
+            die("--since takes a date (2026-11-03) or a number of hours (12)")
+    out_dir = STATE / "summaries"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M")
+    digest = out_dir / f"{stamp}-digest.md"
+    digest.write_text(summary_digest(since))
+    out = Path(a.out).expanduser() if a.out else out_dir / f"{stamp}-summary.md"
+    prompt = ((read(STATE / "recipe.json") or {}).get("summary") or "").strip() or DEFAULT_SUMMARY
+    subprocess.run(["hc", "send", op, SUMMARY_FRAME.format(digest=digest, prompt=prompt, out=out)], capture_output=True)
+    print(json.dumps({"summary": str(out), "digest": str(digest), "operator": op,
+                      "prompt": "recipe" if (read(STATE / "recipe.json") or {}).get("summary") else "default"}))
+
+
+def cmd_ack(a):
+    with locked():
+        p = task_path(a.id) if read(task_path(a.id)) else watcher_path(a.id)
+        x = read(p) or die(f"no task or watcher {a.id}")
+        cleared = len(x.get("fyis") or ([x["fyi"]] if x.get("fyi") else []))
+        x.pop("fyis", None)
+        x.pop("fyi", None)
+        if a.fyi:  # only the FYIs; a "needs you" flag stays
+            if cleared:
+                x.setdefault("history", []).append({"at": now(), "status": x.get("status"), "note": f"user acknowledged {cleared} FYI(s)"})
+            write(p, x)
+            print(json.dumps({"acked": a.id, "fyis_cleared": cleared}))
+            return
+        x["attention"] = None
+        if x.get("status") == "needs-you":  # seen by the person; it now waits on them or others
+            x["status"] = "waiting"
+            x["updated_at"] = now()
+            x["history"].append({"at": now(), "status": "waiting", "note": "acknowledged"})
+        write(p, x)
+    print(json.dumps({"acked": a.id}))
+
+
+def cmd_status(a):
+    ensure_dirs()
+    write_board()
+    if a.json:
+        print((STATE / "board.json").read_text())
+        return
+    sess = session()
+    if not sess:
+        print("no session. Run `oncall-mc start`.")
+        return
+    print(f"session {sess['id']}" + (f" ({sess['name']})" if sess.get("name") else "") +
+          f", started {time.strftime('%Y-%m-%d %H:%M', time.localtime(sess['started_at']))}")
+    dead = [f"{r} {i}" for r, i, addr in session_terminals() if r in ("operator", "watcher", "ticker")
+            and not program_alive(addr) and (r == "operator" or (read(watcher_path(i)) or {}).get("status") != "stopped")]
+    if dead:
+        print(f"NOT RUNNING: {', '.join(dead)}. Run `oncall-mc resume`.")
+    op = read(STATE / "operator.json") or {}
+    print(f"operator: {op.get('address') or '-'} ({agent_state(op['address']) if op.get('address') else 'not started'})")
+    tasks = all_json("tasks")
+    for w in all_json("watchers") + [{"id": "operator", "channel": "(direct tasks)", "status": ""}]:
+        mine = [t for t in tasks if t["watcher"] == w["id"] and t["status"] in ACTIVE]
+        if w["id"] == "operator" and not mine:
+            continue
+        print(f"\n{w['id']}  {w['channel']}  {w['status']}")
+        for t in mine:
+            flag = " !" if t.get("attention") else ""
+            print(f"  {t['id']} {t['status']:10} {t['title']}{flag}")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="oncall-mc", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    p.add_argument("--version", action="version", version=f"oncall-mc {VERSION}")
+    s = sub.add_parser("update", help="pull the latest version (git checkout) and reinstall the panel")
+    s.add_argument("--no-link", action="store_true")
+    s.set_defaults(fn=cmd_update)
+    s = sub.add_parser("guide", help="the manual for agents: read this first")
+    s.set_defaults(fn=cmd_guide)
+    s = sub.add_parser("install", help="check prerequisites, install the Herdr panel, link onto PATH, create config")
+    s.add_argument("--no-link", action="store_true", help="don't link into ~/.local/bin")
+    s.set_defaults(fn=cmd_install)
+    s = sub.add_parser("start", help="start a new session (archives the previous one)")
+    s.add_argument("--name", help="a label for the shift")
+    s.add_argument("--workdir", help="folder agents start in (default: current folder, remembered)")
+    s.add_argument("--replace", action="store_true", help="stop a session that still has live agents first")
+    s.add_argument("--recipe", help="bootstrap from a recipe (name or path): modes, operator instructions, watchers")
+    s.add_argument("--skip-doctor", action="store_true", help="start without a passing `oncall-mc doctor`")
+    s.add_argument("--no-switch", action="store_true", help="don't switch Herdr to the space")
+    s.set_defaults(fn=cmd_start)
+    for name in ("resume", "up"):
+        s = sub.add_parser(name, help="bring back whatever died in the current session and show it" if name == "resume" else "same as resume")
+        s.add_argument("--panel", action="store_true", help="add the panel pane again (if it was closed)")
+        s.add_argument("--workdir")
+        s.add_argument("--no-switch", action="store_true", help="don't switch Herdr to the space")
+        s.set_defaults(fn=cmd_resume)
+    s = sub.add_parser("config", help="show or set the agent commands (setting them marks the config reviewed)")
+    s.add_argument("--operator", help="operator command, e.g. \"claude --model X\"")
+    s.add_argument("--watcher", help="watcher command, with the flags that skip approval prompts")
+    s.add_argument("--worker", help="worker command, with the flags that skip approval prompts")
+    s.add_argument("--workdir")
+    s.add_argument("--max-workers", type=int)
+    s.add_argument("--reviewed", action="store_true", help="the user approved the current commands as they are")
+    s.set_defaults(fn=cmd_config)
+    s = sub.add_parser("doctor", help="preflight: prove unattended agents can run, write state and read Slack")
+    s.add_argument("--wait", type=int, default=90, help="seconds to wait for the probe agents this run (default 90)")
+    s.add_argument("--restart", action="store_true", help="discard running probes and start new ones")
+    s.add_argument("--recipe", help="also probe every model/effort combination this recipe would run")
+    s.set_defaults(fn=cmd_doctor)
+    s = sub.add_parser("probe", help="(internal) run by doctor's probe agents")
+    s.add_argument("token")
+    s.add_argument("--slack", choices=["yes", "no"], required=True)
+    s.set_defaults(fn=cmd_probe)
+    s = sub.add_parser("status", aliases=["ls"], help="session overview")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_status)
+    s = sub.add_parser("end", help="stop every agent of the session, archive it, close the space")
+    s.add_argument("--yes", action="store_true", help="confirmed with the user")
+    s.set_defaults(fn=cmd_end)
+    r = sub.add_parser("recipe", help="recipes: bootstrap files with modes and watchers").add_subparsers(dest="sub", required=True)
+    r.add_parser("ls", help="list recipes").set_defaults(fn=cmd_recipe_ls)
+    s = r.add_parser("add", help="save a recipe from stdin (pasted text) or --file, after checking it")
+    s.add_argument("name")
+    s.add_argument("--file")
+    s.add_argument("--force", action="store_true", help="replace an existing recipe with this name")
+    s.set_defaults(fn=cmd_recipe_add)
+    for name, fn, h in (("show", cmd_recipe_show, "show a recipe as resolved"), ("check", cmd_recipe_check, "validate a recipe"),
+                        ("apply", cmd_recipe_apply, "add a recipe's modes and watchers to the running session")):
+        s = r.add_parser(name, help=h)
+        s.add_argument("name", help="recipe name or path")
+        s.set_defaults(fn=fn)
+    sub.add_parser("modes", help="the worker modes available in this session").set_defaults(fn=cmd_modes)
+    s = sub.add_parser("tell", help="send a message to the operator")
+    s.add_argument("message")
+    s.set_defaults(fn=cmd_tell)
+
+    w = sub.add_parser("watcher", help="(operator) manage watchers").add_subparsers(dest="sub", required=True)
+    s = w.add_parser("new")
+    s.add_argument("--channel", required=True)
+    s.add_argument("--channel-id")
+    s.add_argument("--goal", required=True, help="what counts as interesting and what workers may do")
+    s.add_argument("--interval", type=int, default=120, help="seconds between cycles (min 30)")
+    s.add_argument("--lookback", default="1h", help="how far back the first cycle reads")
+    s.add_argument("--name")
+    s.add_argument("--mode", help="a worker mode from this session's recipe (`oncall-mc modes`)")
+    s.add_argument("--mode-prompt", help="an ad hoc worker mode: what workers may do, as a prompt")
+    s.add_argument("--model", help="the watcher's own model")
+    s.add_argument("--effort", help="the watcher's own reasoning effort")
+    s.add_argument("--worker-model", help="model for this watcher's workers")
+    s.add_argument("--worker-effort", help="reasoning effort for this watcher's workers")
+    s.set_defaults(fn=cmd_watcher_new)
+    s = w.add_parser("set", help="change a running watcher (applies within seconds)")
+    s.add_argument("id")
+    s.add_argument("--interval", type=int, help="seconds between cycles (min 30)")
+    s.set_defaults(fn=cmd_watcher_set)
+    s = w.add_parser("stat")
+    s.add_argument("id")
+    s.add_argument("--cursor")
+    s.add_argument("--seen", type=int, default=0)
+    s.add_argument("--matched", type=int, default=0)
+    s.add_argument("--error")
+    s.add_argument("--note")
+    s.set_defaults(fn=cmd_watcher_stat)
+    s = w.add_parser("restart", help="bring back a stopped watcher with its stats and saved Slack position")
+    s.add_argument("id")
+    s.add_argument("--from-now", action="store_true", help="skip the backlog: watch only messages from now on")
+    s.add_argument("--force", action="store_true", help="restart even if another running watcher covers the channel")
+    s.set_defaults(fn=cmd_watcher_restart)
+    for name, fn in (("show", cmd_watcher_show), ("stop", cmd_watcher_stop), ("remove", cmd_watcher_remove)):
+        s = w.add_parser(name)
+        s.add_argument("id")
+        s.set_defaults(fn=fn)
+    w.add_parser("ls").set_defaults(fn=cmd_watcher_ls)
+
+    t = sub.add_parser("task", help="(operator, watchers, workers) manage tasks").add_subparsers(dest="sub", required=True)
+    s = t.add_parser("new")
+    s.add_argument("--watcher", required=True, help="watcher id, or 'operator' for direct tasks")
+    s.add_argument("--title", required=True)
+    s.add_argument("--source", help="Slack permalink or URL that this task is about (deduplicated)")
+    s.add_argument("--brief")
+    s.add_argument("--brief-file")
+    s.add_argument("--no-dispatch", action="store_true")
+    s.add_argument("--mode", help="worker mode (default: the watcher's mode)")
+    s.add_argument("--mode-prompt", help="an ad hoc worker mode, as a prompt")
+    s.add_argument("--model", help="the worker's model (default: watcher, then mode, then recipe)")
+    s.add_argument("--effort", help="the worker's reasoning effort")
+    s.set_defaults(fn=cmd_task_new)
+    s = t.add_parser("update")
+    s.add_argument("id")
+    s.add_argument("--status", choices=STATUSES)
+    s.add_argument("--summary")
+    s.add_argument("--title")
+    s.add_argument("--pr", action="append")
+    s.add_argument("--link", action="append")
+    s.add_argument("--note")
+    s.set_defaults(fn=cmd_task_update)
+    s = t.add_parser("send", help="give a task's worker more work (sets the task back to triaging)")
+    s.add_argument("id")
+    s.add_argument("message")
+    s.set_defaults(fn=cmd_task_send)
+    s = t.add_parser("reassign", help="move a task to another watcher or to the operator")
+    s.add_argument("id")
+    s.add_argument("--to", required=True, help="watcher id, or 'operator'")
+    s.add_argument("--note", help="why (passed to the agents)")
+    s.set_defaults(fn=cmd_task_reassign)
+    s = t.add_parser("ls")
+    s.add_argument("--watcher")
+    s.add_argument("--all", action="store_true")
+    s.set_defaults(fn=cmd_task_ls)
+    for name, fn in (("show", cmd_task_show), ("dispatch", cmd_task_dispatch)):
+        s = t.add_parser(name)
+        s.add_argument("id")
+        s.set_defaults(fn=fn)
+
+    s = sub.add_parser("escalate", help="the user's input is needed: a decision, or a finished report to review (sets needs-you)")
+    s.add_argument("id")
+    s.add_argument("message", help="what exactly the user must decide or review")
+    s.add_argument("--need", choices=["decision", "review"], default="decision",
+                   help="decision: only the user can decide; review: the worker is done but cannot resolve it, report ready")
+    s.set_defaults(fn=cmd_escalate)
+    s = sub.add_parser("notify", help="an FYI for the user: tells the operator, keeps the task's status (not needs-you)")
+    s.add_argument("id")
+    s.add_argument("message")
+    s.set_defaults(fn=cmd_notify)
+    s = sub.add_parser("brief", help="ask the operator to catch the user up on a task or a flagged watcher")
+    s.add_argument("id")
+    s.set_defaults(fn=cmd_brief)
+    s = sub.add_parser("summary", help="ask the operator for an end-of-shift summary (recipe [summary] prompt, else default)")
+    s.add_argument("--since", help="only tasks updated since a date (2026-11-03) or N hours ago (12)")
+    s.add_argument("--out", help="where to write the summary (default: state/summaries/<time>-summary.md)")
+    s.set_defaults(fn=cmd_summary)
+    s = sub.add_parser("ack", help="the user saw it: clears FYIs and the needs-you flag (a needs-you task becomes waiting)")
+    s.add_argument("id")
+    s.add_argument("--fyi", action="store_true", help="clear only the FYIs; leave a needs-you flag as it is")
+    s.set_defaults(fn=cmd_ack)
+    s = sub.add_parser("tick", help="(internal) wake a watcher every interval while it is idle")
+    s.add_argument("id")
+    s.set_defaults(fn=cmd_tick)
+
+    a = p.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

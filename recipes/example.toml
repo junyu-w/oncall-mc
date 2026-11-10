@@ -1,0 +1,106 @@
+# An oncall-mc recipe: bootstraps a Mission Control session.
+#
+#   oncall-mc start --recipe example        # new session from this recipe
+#   oncall-mc recipe apply example          # add its modes and watchers to the running session
+#   oncall-mc recipe check example          # validate it
+#
+# Put your own recipes in ~/.config/oncall-mc/recipes/<name>.toml. They hold your channel IDs and paths,
+# so keep them out of shared repos. TOML needs Python 3.11+. A .json file with the same shape also works.
+
+name = "example"
+description = "Example on-call shift: a paging channel, a data-alerts channel and a team questions channel."
+
+# Optional: the folder agents start in. Default: where you run `oncall-mc start`.
+# workdir = "~/src/my-service"
+
+# Optional: how many workers may triage at once.
+# max_active_workers = 3
+
+# Optional: models and reasoning effort per role. oncall-mc swaps these into the agent commands from
+# state/config.json (Codex: -m / -c model_reasoning_effort=; Claude: --model / --effort). Leave a field out to
+# keep what the command already says. Modes and single watchers can override them (see below).
+[agents.operator]
+model = "claude-opus-5-5"
+
+[agents.watcher]
+model = "gpt-6.1-sol"
+effort = "medium"       # watchers mostly read and sort; they rarely need the top effort
+
+[agents.worker]
+model = "gpt-6.1-sol"
+effort = "high"
+
+[operator]
+# Standing instructions for the operator for this kind of shift.
+instructions = """
+I am the on-call for the payments team this week. Keep updates to 1-3 lines.
+When I ask you to watch an incident channel, use mode `triage-only`, interval 300, and this interest:
+track the incident status and key decisions, and start a worker when someone asks a question my team should answer.
+"""
+
+# Worker modes. A mode is a prompt: what a worker may do, and how. Watchers pick one by name, and oncall-mc
+# attaches the mode's prompt to every worker brief. Write them the way you would brief a colleague.
+[modes.triage-only]
+prompt = """
+Triage read-only. Work in this order: impact, then root cause, then mitigation. Write your findings to your report
+file as you go. Do not post, react or reply anywhere. Do not change code, config or flags.
+"""
+
+[modes.triage-reply]
+prompt = """
+Triage read-only, in three steps, and reply in the alert's Slack thread after each step:
+"*1/3 Impact:*" (whether the on-call must look now; ongoing or recovered; scope; customer impact),
+"*2/3 Root cause:*" (cause, confidence, 2-4 evidence links), "*3/3 Mitigation:*" (action, owner, how to verify).
+Keep each reply under 8 lines. These three replies are the only Slack actions you may take.
+Never acknowledge, resolve or reassign the page.
+"""
+
+[modes.draft-answer]
+prompt = """
+Find the answer to the question from code, docs, logs and data. Write a short draft reply, with links, in your
+report file, then set your task to needs-you so the on-call can review it. Do not post it.
+"""
+
+[modes.fix-with-pr]
+effort = "xhigh"        # a mode can set its workers' model/effort; it beats [agents.worker]
+prompt = """
+Triage read-only first and write the root cause, with evidence, to your report file. Only if the cause is a clear
+code bug: fix it in a new git worktree, starting with a failing test, run the affected tests, and open a DRAFT
+pull request that explains the issue, the fix and the test evidence. Record the PR with `oncall-mc task update
+--pr`. Never merge, deploy or push to the default branch. Post nothing in Slack.
+"""
+
+# Optional: what `oncall-mc summary` writes at the end of the shift. Without it, a default summary is used.
+[summary]
+prompt = """
+Write the summary in our team's on-call log format: a "Pages" table (alert, real customer impact?, correct
+threshold?, action taken), an "Incidents" table (incident, issue, status, notes), and a "Follow-ups" list with
+owners. Keep each cell to a few plain sentences, with links.
+"""
+
+# Defaults for every watcher below.
+[defaults]
+interval = 120          # seconds between checks (min 30)
+lookback = "1h"         # how far back the first check reads
+mode = "triage-only"
+
+[[watchers]]
+channel = "#alerts-payments"
+# channel_id = "C0123456789"   # optional; the watcher looks it up when missing
+interval = 60
+mode = "triage-reply"
+# worker_effort = "xhigh"   # per watcher: model/effort for the watcher itself, worker_model/worker_effort for its workers
+interest = "PagerDuty pages assigned to me. Pages for other people: watch them, and act only if they are reassigned to me."
+escalate = "the issue is ongoing and customer-facing, or a worker is stuck."
+
+[[watchers]]
+channel = "#data-quality-alerts"
+interval = 600
+interest = "New data-monitoring alerts on tables my team owns. One task per distinct monitor; link repeat alerts to the existing task."
+escalate = "an alert affects a production input, or it keeps growing."
+
+[[watchers]]
+channel = "#ask-payments-team"
+mode = "draft-answer"
+interest = "Questions for my team that nobody has answered after about 15 minutes."
+# enabled = false   # keep a watcher in the recipe without starting it
