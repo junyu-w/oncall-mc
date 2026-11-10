@@ -164,3 +164,7 @@ Change behavior by editing the role briefs in `prompts/`:
 - Agents keep running when the Herdr window closes, but stop when the machine sleeps or restarts.
   After a restart, run `oncall-mc resume`.
 - Every watcher check is a model call. Use longer intervals for quiet channels.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
