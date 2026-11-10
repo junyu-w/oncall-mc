@@ -6,6 +6,12 @@ The space has two panes:
 - A **panel** that lists every Slack **watcher** with its stats, and the triage **worker** tasks under each watcher:
   status, summary, PRs and links. Filter by watcher or task status. Click any row to open its live terminal.
 
+![Mission Control during an on-call shift: the operator on the left, the panel on the right](screenshot.png)
+
+*A mock shift (made-up data). Left: the operator, briefing the on-call on a page and taking their decision.
+Right: the panel. Two tasks need input (a rollback decision and a PR review), one FYI waits for "Got it", and
+five watchers sit below with their tasks, PRs and stats.*
+
 ## Get started with one prompt
 
 Paste this into any coding agent running in Herdr:
