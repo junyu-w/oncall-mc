@@ -1,21 +1,9 @@
 # Mission Control
 
-> **This panel needs the `oncall-mc` CLI from this repo.** The panel only shows what the CLI writes. On its own
-> it reads "No session yet". Install both with one command:
-> `git clone https://github.com/junyu-w/oncall-mc ~/.local/share/oncall-mc && ~/.local/share/oncall-mc/bin/oncall-mc install`
-> (it installs this panel, links `oncall-mc` into `~/.local/bin`, and adds an agent skill). Then tell any agent:
-> "read `oncall-mc guide` and start oncall mission control for my shift".
->
-> **What it runs:**
-> - **Programs:** the panel calls `exec` to run `<repo>/bin/oncall-mc` (for Brief me, Got it and Summarize shift)
->   and to open links with `open`, `xdg-open` or `start`.
-> - **Files:** it reads files outside its own folder: `<repo>/state/board.json`.
-> - **Network:** none from the panel itself. The agents use their own Slack tools.
-
-Mission Control runs an on-call shift in a Herdr space called "Mission Control". The left pane is the operator,
-an agent you talk to. The right pane is this panel. It shows what needs your input, FYIs waiting for a "Got it",
-the operator's own tasks, and every Slack watcher with the triage tasks it started. Click any row to open that
-agent's live terminal.
+Mission Control runs an on-call shift in a Herdr space called "Mission Control": the operator, an agent you talk to,
+on the left, and this panel on the right. The panel shows what needs your input, FYIs waiting for a "Got it", the
+operator's own tasks, and every Slack watcher with the triage tasks it started; click any row to open that
+agent's live terminal. It works together with the `oncall-mc` CLI from the same repo.
 
 ![Mission Control](preview.png)
 
@@ -86,6 +74,14 @@ body 12.5, metadata 11.5). Every color is a theme color, so the panel follows th
 
 ## Built from
 
+- **Requires the `oncall-mc` CLI** from this repo. The panel only shows what the CLI writes, and on its own reads
+  "No session yet". Install both with one command (it also links `oncall-mc` into `~/.local/bin` and adds an
+  agent skill):
+  `git clone https://github.com/junyu-w/oncall-mc ~/.local/share/oncall-mc && ~/.local/share/oncall-mc/bin/oncall-mc install`
+  Then tell any agent: "read `oncall-mc guide` and start oncall mission control for my shift".
+- **What the panel runs:** `exec` of `<repo>/bin/oncall-mc` (Brief me, Got it, Summarize shift) and of `open`,
+  `xdg-open` or `start` for links. It reads `<repo>/state/board.json`, outside its own folder. The panel makes no
+  network calls; the agents use their own Slack tools.
 - **This mod:** `mods/mission-control/main.js`, one View class. Props: `{ state: <absolute state folder> }`.
   - Reads `<state>/board.json` (`{ operator, session, watchers[], tasks[] }`).
   - Live status from `agents()` and `terminals()`.
